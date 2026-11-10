@@ -1,5 +1,6 @@
-// Pan/Slider motion rig - ESP32-C3 SuperMini, CNC shield drivers, 16x2 I2C LCD, rotary encoder.
-// X = linear slider (MIN/MAX limit switches), Y = pan. Everything is driven from the encoder.
+// Simple Motion Rig - ESP32-C3 SuperMini, CNC-shield drivers, 16x2 I2C LCD, rotary encoder.
+// One shot = START pose -> END pose (slider + pan together). Power on, home, set START / END / TIME, run.
+// Controls: turn = move / scroll, click = select / next, hold = cancel. Hold on the first screen = diagnostics.
 #include <Arduino.h>
 #include <Wire.h>
 #include <stdarg.h>
@@ -20,87 +21,105 @@
 #define PIN_LIMIT_MIN 20
 #define PIN_LIMIT_MAX 21
 
-// ---------------- USER SETTINGS (verify these against your build) ----------------
+// ---------------- SETTINGS (verify against your build) ----------------
 #define LCD_COLS 16
 #define LCD_ROWS 2
 static const uint8_t LCD_ROW_OFFSET[2] = {0x00, 0x40};
-#define LIMIT_ACTIVE_LEVEL LOW      // 3-wire module: flip to HIGH if Diagnostics shows inverted
+#define LIMIT_ACTIVE_LEVEL LOW       // flip to HIGH if Diagnostics shows the switches inverted
 #define X_DIR_INVERT false
 #define Y_DIR_INVERT false
 #define ENC_INVERT false
-#define ENC_TRANSITIONS_PER_DETENT 4  // KY-040 usually 4 (try 2 if one click skips)
+#define ENC_TRANSITIONS_PER_DETENT 4
 
-#define X_STEPS_PER_MM 80.0f          // 16x microstep, 20T GT2: 3200 steps / 40 mm
-#define Y_STEPS_PER_DEG (12800.0f / 360.0f)  // 200*16*4 (4:1) steps per 360 deg
+#define X_STEPS_PER_MM 80.0f                  // 16x microstep, 20T GT2 pulley
+#define Y_STEPS_PER_DEG (12800.0f / 360.0f)   // 200*16 steps, 4:1 reduction
 #define X_VMAX 3000.0f
 #define Y_VMAX 3000.0f
 #define X_ACC 6000.0f
 #define Y_ACC 6000.0f
-static const float SPEED_PCT[3] = {0.25f, 0.5f, 1.0f};
-
-#define X_HOME_SPEED 1000.0f
+#define JOG_PCT 0.6f                          // speed while setting poses / going to start
+#define PAN_LIMIT_DEG 350.0f                  // keeps cables from winding up
+#define X_HOME_SPEED 1200.0f
 #define X_BACKOFF_STEPS 240
-#define X_HOME_TIMEOUT_MS 120000UL
-
-#define MAX_KF 20
-#define DEFAULT_KF_SECONDS 5.0f
+#define X_HOME_TIMEOUT_MS 300000UL
 #define PLAY_KP 6.0f
 #define PLAY_RAMP_MS 1000UL
-
-static const float X_STEP_MM[4] = {0.5f, 2.0f, 10.0f, 50.0f};
-static const float Y_STEP_DEG[4] = {0.5f, 2.0f, 10.0f, 45.0f};
+static const uint8_t DELAY_S[4] = {0, 3, 5, 10};
 
 #define DEBOUNCE_MS 25
 #define LONG_MS 700
-#define DOUBLE_MS 280
 #define DEG_CH ((char)0xDF)
 
-// ---------------- GLOBALS ----------------
+// ---------------- STATE ----------------
 AccelStepper stepX(AccelStepper::DRIVER, PIN_X_STEP, PIN_X_DIR);
 AccelStepper stepY(AccelStepper::DRIVER, PIN_Y_STEP, PIN_Y_DIR);
 LiquidCrystal_I2C *lcd = nullptr;
 Preferences prefs;
 
-struct Keyframe { int32_t x; int32_t y; float dur; };  // dur = seconds from previous keyframe
-Keyframe kf[MAX_KF];
-uint8_t kfCount = 0;
-struct Settings { uint8_t loop; uint8_t ease; uint8_t speed; uint8_t delayIdx; } cfg = {0, 1, 1, 0};
-#define NUM_SLOTS 5
-static const uint8_t DELAY_S[4] = {0, 3, 5, 10};   // start-delay choices in seconds
-uint8_t slot = 0, slotSel = 0;
+// Everything the customer sets lives in one checksummed record.
+struct Shot {
+  int32_t sx, sy, ex, ey, xmax;          // start pose, end pose, measured slider travel (steps)
+  uint16_t dur;                          // seconds
+  uint8_t ease, loop, delayIdx, flags;
+  uint8_t pad[2];
+  uint32_t ck;
+};
+#define F_START 1
+#define F_END 2
+#define F_XMAX 4
+Shot shot;
 
-bool xHomed = false, xCal = false;
-long xMaxSteps = 0;
-
-char want[LCD_ROWS][LCD_COLS + 1];
-char shown[LCD_ROWS][LCD_COLS + 1];
-int curR = -1, curC = -1;
-
-enum Screen { S_MENU, S_JOG, S_KFLIST, S_KFACT, S_KFTIME, S_PLAY, S_HOMEMENU, S_HOMING, S_SETTINGS, S_DIAG, S_CONFIRM, S_SLOT };
+bool xHomed = false;
+enum Screen { S_HOME, S_HOMING, S_MENU, S_POSE, S_TIME, S_RUN, S_DIAG };
 enum HomeStage { H_IDLE, H_SEEK_MIN, H_BACKOFF_MIN, H_SEEK_MAX, H_BACKOFF_MAX, H_RETURN };
-enum PlayStage { P_IDLE, P_GOTO, P_DELAY, P_RUN };
-Screen scr = S_MENU;
+enum RunStage { R_IDLE, R_GOTO, R_DELAY, R_RUN };
+Screen scr = S_HOME;
 HomeStage homeStage = H_IDLE;
-PlayStage playStage = P_IDLE;
-int cur = 0, top = 0, selKF = 0;
-int jogAxis = 0, jogStep = 1, diagPage = 0;
-bool homeMeasure = false;
-long homeTrip = 0;
-uint32_t homeT0 = 0, playT0 = 0, delayT0 = 0, lastDraw = 0;
-int playStart = 0;
-bool playFirst = true;
-float playTotal = 0;
+RunStage runStage = R_IDLE;
+int cur = 0, top = 0, poseWhich = 0, poseAxis = 0;
+bool homeMeasure = false, forceMeasure = false, maxWasClear = false, runAbort = false;
+long homeTrip = 0, seekStartP = 0;
+uint32_t homeT0 = 0, runT0 = 0, delayT0 = 0, lastDraw = 0;
+int32_t ax_ = 0, ay_ = 0, bx_ = 0, by_ = 0;       // current pass: from A to B
+int runPass = 0;
+float gotoTot = 1, slewX = 0, slewY = 0;
+uint32_t slewT = 0;
+uint16_t timeBackup = 10;
+
+char want[LCD_ROWS][LCD_COLS + 1], shown[LCD_ROWS][LCD_COLS + 1];
+int curR = -1, curC = -1;
 char toastMsg[LCD_COLS + 1] = "";
 uint32_t toastUntil = 0;
-bool g_wantDouble = false;
+bool toastSticky = false;
 
-// ---------------- ENCODER ----------------
+// ---------------- SAVED DATA ----------------
+uint32_t fnv(const void *p, size_t n) {
+  const uint8_t *b = (const uint8_t *)p; uint32_t h = 2166136261u;
+  while (n--) { h ^= *b++; h *= 16777619u; }
+  return h;
+}
+void defaultShot() { memset(&shot, 0, sizeof shot); shot.dur = 10; shot.ease = 1; }
+bool shotSane(const Shot &s) {
+  if (s.dur < 1 || s.dur > 600 || s.ease > 1 || s.loop > 1 || s.delayIdx > 3) return false;
+  if (labs(s.sx) > 5000000L || labs(s.ex) > 5000000L || labs(s.sy) > 50000000L || labs(s.ey) > 50000000L) return false;
+  if ((s.flags & F_XMAX) && (s.xmax <= 0 || s.xmax > 10000000L)) return false;
+  return true;
+}
+void saveShot() { shot.ck = fnv(&shot, offsetof(Shot, ck)); prefs.putBytes("shot", &shot, sizeof shot); }
+void loadShot() {
+  prefs.begin("rig", false);
+  defaultShot();
+  if (prefs.getBytesLength("shot") != sizeof(Shot)) return;
+  Shot t; prefs.getBytes("shot", &t, sizeof t);
+  if (fnv(&t, offsetof(Shot, ck)) == t.ck && shotSane(t)) shot = t;     // corrupt data -> safe defaults
+}
+
+// ---------------- ENCODER + BUTTON ----------------
 static const int8_t ENC_TBL[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 volatile int32_t encAcc = 0;
 volatile uint8_t encPrev = 0;
 int32_t encTotal = 0;
 portMUX_TYPE encMux = portMUX_INITIALIZER_UNLOCKED;
-
 void IRAM_ATTR encISR() {
   uint8_t s = (digitalRead(PIN_ENC_CLK) << 1) | digitalRead(PIN_ENC_DT);
   portENTER_CRITICAL_ISR(&encMux);
@@ -108,7 +127,6 @@ void IRAM_ATTR encISR() {
   encPrev = s;
   portEXIT_CRITICAL_ISR(&encMux);
 }
-
 int readDetents() {
   int d;
   portENTER_CRITICAL(&encMux);
@@ -119,77 +137,28 @@ int readDetents() {
   encTotal += d;
   return d;
 }
-
-enum Ev { EV_NONE, EV_CLICK, EV_DOUBLE, EV_LONG };
-struct Input { int rot; int rotHeld; Ev ev; };
-
-bool btnStable = false, btnRaw = false, btnLongFired = false, btnTurned = false, clickPending = false;
-uint32_t btnRawT = 0, btnPressT = 0, clickT = 0;
-
+enum Ev { EV_NONE, EV_CLICK, EV_LONG };
+struct Input { int rot; Ev ev; };
+bool btnStable = false, btnRaw = false, btnLongFired = false, btnTurned = false;
+uint32_t btnRawT = 0, btnPressT = 0;
 Input pollInput() {
-  Input in = {0, 0, EV_NONE};
+  Input in = {0, EV_NONE};
   uint32_t now = millis();
   bool raw = (digitalRead(PIN_ENC_SW) == LOW);
   if (raw != btnRaw) { btnRaw = raw; btnRawT = now; }
   if (btnRaw != btnStable && now - btnRawT >= DEBOUNCE_MS) {
     btnStable = btnRaw;
     if (btnStable) { btnPressT = now; btnLongFired = false; btnTurned = false; }
-    else if (!btnLongFired && !btnTurned) {
-      if (g_wantDouble) {
-        if (clickPending && now - clickT < DOUBLE_MS) { in.ev = EV_DOUBLE; clickPending = false; }
-        else { clickPending = true; clickT = now; }
-      } else in.ev = EV_CLICK;
-    }
+    else if (!btnLongFired && !btnTurned) in.ev = EV_CLICK;
   }
-  if (btnStable && !btnLongFired && !btnTurned && now - btnPressT >= LONG_MS) {
-    btnLongFired = true; clickPending = false; in.ev = EV_LONG;
-  }
-  if (!g_wantDouble) clickPending = false;
-  if (clickPending && !btnStable && now - clickT >= DOUBLE_MS) { clickPending = false; in.ev = EV_CLICK; }
-  int d = readDetents();
-  if (d) { if (btnStable) { in.rotHeld = d; btnTurned = true; clickPending = false; } else in.rot = d; }
+  if (btnStable && !btnLongFired && !btnTurned && now - btnPressT >= LONG_MS) { btnLongFired = true; in.ev = EV_LONG; }
+  in.rot = readDetents();
+  if (in.rot && btnStable) btnTurned = true;     // turning while pressed never counts as a click
   return in;
 }
 
-// ---------------- PERSISTENCE ----------------
-void slotKeys(uint8_t n, char *kn, char *kb) { snprintf(kn, 8, "kfn%u", n); snprintf(kb, 8, "kf%u", n); }
-void saveKeyframes() {
-  char kn[8], kb[8]; slotKeys(slot, kn, kb);
-  prefs.putUChar(kn, kfCount); prefs.putBytes(kb, kf, kfCount * sizeof(Keyframe));
-}
-void saveSettings() { prefs.putBytes("cfg", &cfg, sizeof cfg); }
-void saveCalibration() { prefs.putBool("xcal", xCal); prefs.putLong("xmax", xMaxSteps); }
-// Loads slot n into the working keyframe list. Slot 0 also picks up keyframes saved by older firmware.
-void loadSlot(uint8_t n) {
-  slot = n; kfCount = 0;
-  char kn[8], kb[8]; slotKeys(n, kn, kb);
-  const char *cn = kn, *cb = kb;
-  if (!prefs.isKey(kn) && n == 0 && prefs.isKey("kfn")) { cn = "kfn"; cb = "kf"; }
-  kfCount = prefs.getUChar(cn, 0);
-  if (kfCount > MAX_KF) kfCount = 0;
-  if (kfCount) prefs.getBytes(cb, kf, kfCount * sizeof(Keyframe));
-}
-uint8_t slotCount(uint8_t n) {
-  if (n == slot) return kfCount;
-  char kn[8], kb[8]; slotKeys(n, kn, kb);
-  const char *cn = kn;
-  if (!prefs.isKey(kn) && n == 0 && prefs.isKey("kfn")) cn = "kfn";
-  uint8_t c = prefs.getUChar(cn, 0);
-  return c > MAX_KF ? 0 : c;
-}
-void loadAll() {
-  prefs.begin("slider", false);
-  uint8_t sl = prefs.getUChar("slot", 0);
-  loadSlot(sl < NUM_SLOTS ? sl : 0);
-  if (prefs.getBytesLength("cfg") == sizeof cfg) prefs.getBytes("cfg", &cfg, sizeof cfg);
-  if (cfg.speed > 2) cfg.speed = 1;
-  if (cfg.delayIdx > 3) cfg.delayIdx = 0;
-  xCal = prefs.getBool("xcal", false);
-  xMaxSteps = prefs.getLong("xmax", 0);
-  if (xMaxSteps <= 0) xCal = false;
-}
-
 // ---------------- LCD ----------------
+bool lcdOK = true; uint8_t lcdAddr = 0; uint32_t lcdProbeT = 0;
 void row(uint8_t r, const char *fmt, ...) {
   if (r >= LCD_ROWS) return;
   char b[40];
@@ -201,7 +170,8 @@ void row(uint8_t r, const char *fmt, ...) {
   }
 }
 void lcdFlush(int budget) {
-  if (!lcd) return;
+  if (!lcd || !lcdOK) return;
+  int b0 = budget; uint32_t t0 = micros();
   for (int r = 0; r < LCD_ROWS && budget > 0; r++)
     for (int c = 0; c < LCD_COLS && budget > 0; c++) {
       if (want[r][c] == shown[r][c]) continue;
@@ -209,72 +179,99 @@ void lcdFlush(int budget) {
       lcd->write((uint8_t)want[r][c]);
       shown[r][c] = want[r][c]; curC++; budget--;
     }
+  if (micros() - t0 > (uint32_t)(b0 * 2000 + 2000)) { lcdOK = false; lcdProbeT = millis(); }   // bus failing: stop using it
 }
-void toast(const char *m) { strncpy(toastMsg, m, LCD_COLS); toastMsg[LCD_COLS] = 0; toastUntil = millis() + 1500; }
 bool i2cPresent(uint8_t a) { Wire.beginTransmission(a); return Wire.endTransmission() == 0; }
+void lcdHealth(bool busy) {
+  if (!lcd || busy) return;                   // only check / recover while the rig is idle
+  uint32_t now = millis();
+  if (now - lcdProbeT < 1000) return;
+  lcdProbeT = now;
+  bool p = i2cPresent(lcdAddr);
+  if (p && !lcdOK) { lcd->init(); lcd->backlight(); Wire.setClock(400000); memset(shown, 0, sizeof shown); curR = curC = -1; }
+  lcdOK = p;
+}
+// Errors you must see are sticky: they stay until you click (the click only dismisses them).
+void toast(const char *m, bool sticky = false, uint32_t ms = 1200) {
+  strncpy(toastMsg, m, LCD_COLS); toastMsg[LCD_COLS] = 0;
+  toastSticky = sticky; toastUntil = millis() + (sticky ? 3600000UL : ms);
+}
+
+// ---------------- LIMIT SWITCHES (debounced) ----------------
+#define LIMIT_PRESS_US 3000UL
+#define LIMIT_RELEASE_US 10000UL
+struct Lim { bool state; bool raw; uint32_t t; };
+Lim limMin = {false, false, 0}, limMax = {false, false, 0};
+void pollLim(Lim &l, int pin) {
+  bool r = (digitalRead(pin) == LIMIT_ACTIVE_LEVEL);
+  uint32_t now = micros();
+  if (r != l.raw) { l.raw = r; l.t = now; }
+  else if (r != l.state && now - l.t >= (r ? LIMIT_PRESS_US : LIMIT_RELEASE_US)) l.state = r;
+}
+inline void pollLimits() { pollLim(limMin, PIN_LIMIT_MIN); pollLim(limMax, PIN_LIMIT_MAX); }
+inline bool minHit() { return limMin.state; }
+inline bool maxHit() { return limMax.state; }
 
 // ---------------- MOTION HELPERS ----------------
-inline bool minHit() { return digitalRead(PIN_LIMIT_MIN) == LIMIT_ACTIVE_LEVEL; }
-inline bool maxHit() { return digitalRead(PIN_LIMIT_MAX) == LIMIT_ACTIVE_LEVEL; }
-inline float xmm() { return stepX.currentPosition() / X_STEPS_PER_MM; }
-inline float ydeg() { return stepY.currentPosition() / Y_STEPS_PER_DEG; }
-
 void applyProfile() {
-  float p = SPEED_PCT[cfg.speed];
-  stepX.setMaxSpeed(X_VMAX * p); stepX.setAcceleration(X_ACC);
-  stepY.setMaxSpeed(Y_VMAX * p); stepY.setAcceleration(Y_ACC);
+  stepX.setMaxSpeed(X_VMAX * JOG_PCT); stepX.setAcceleration(X_ACC);
+  stepY.setMaxSpeed(Y_VMAX * JOG_PCT); stepY.setAcceleration(Y_ACC);
 }
 long clampX(long t) {
   if (!xHomed) return t;
   if (t < 0) t = 0;
-  if (xCal && t > xMaxSteps) t = xMaxSteps;
+  if ((shot.flags & F_XMAX) && t > shot.xmax) t = shot.xmax;
   return t;
 }
+long clampY(long t) { long m = lroundf(PAN_LIMIT_DEG * Y_STEPS_PER_DEG); return constrain(t, -m, m); }
 void holdX() { stepX.moveTo(stepX.currentPosition()); }
 void holdY() { stepY.moveTo(stepY.currentPosition()); }
+void setScreen(Screen s, int c = 0) { scr = s; cur = c; top = 0; }
+void stopRun(const char *msg, bool sticky = false);
 
-void stopPlay(const char *msg);
-
+// A homed slider is kept inside its travel, so touching a limit switch means steps were lost.
 void guardLimits() {
-  static bool prevMin = false, prevMax = false;
   bool mn = minHit(), mx = maxHit();
-  if (mn && !prevMin) toast("LIMIT MIN HIT");
-  if (mx && !prevMax) toast("LIMIT MAX HIT");
-  prevMin = mn; prevMax = mx;
-  if (homeStage != H_IDLE || (!mn && !mx)) return;   // homing handles the switches itself
-  bool speedMode = (playStage == P_RUN);
+  if (homeStage != H_IDLE || (!mn && !mx)) return;
+  bool speedMode = (runStage == R_RUN);
   float sp = stepX.speed(); long dg = stepX.distanceToGo();
   bool neg = sp < 0 || (!speedMode && dg < 0);
   bool pos = sp > 0 || (!speedMode && dg > 0);
-  const char *which = nullptr;
-  if (mn && neg) which = "LIMIT MIN";
-  else if (mx && pos) which = "LIMIT MAX";
-  if (!which) return;
+  bool hit = (mn && neg) || (mx && pos);
+  if (!hit) return;
   stepX.setCurrentPosition(stepX.currentPosition());
-  if (playStage != P_IDLE) stopPlay(which); else toast(which);
+  if (mx && pos && (shot.flags & F_XMAX)) { shot.flags &= ~F_XMAX; saveShot(); }   // travel was wrong: re-measure
+  xHomed = false;
+  if (runStage != R_IDLE) stopRun("LIMIT HIT-REHOME", true); else toast("LIMIT HIT-REHOME", true);
 }
 
 // ---------------- HOMING ----------------
 void startHome(bool measure) {
   homeMeasure = measure; xHomed = false; homeT0 = millis();
-  stepX.setCurrentPosition(0); stepY.moveTo(stepY.currentPosition());
-  if (minHit() && maxHit()) { toast("LIMIT WIRING?"); return; }
+  stepX.setCurrentPosition(0); stepY.setCurrentPosition(0);     // pan zero = where the camera points now
+  stepX.moveTo(0); stepY.moveTo(0);
+  if (minHit() && maxHit()) { toast("LIMIT WIRING?", true); return; }
+  seekStartP = 0; maxWasClear = false;
   homeStage = minHit() ? H_BACKOFF_MIN : H_SEEK_MIN;
   scr = S_HOMING;
 }
 void finishHome() {
   homeStage = H_IDLE; holdX(); applyProfile();
-  if (homeMeasure) { xCal = true; saveCalibration(); }
-  scr = S_MENU; cur = 0; toast("HOMED");
+  if (homeMeasure) { shot.flags |= F_XMAX; saveShot(); }
+  forceMeasure = false;
+  setScreen(S_MENU, 0); toast("READY");
 }
-void failHome(const char *m) { homeStage = H_IDLE; holdX(); applyProfile(); scr = S_MENU; cur = 0; toast(m); }
-void abortHome() { failHome("HOMING ABORT"); }
-
+void failHome(const char *m, bool sticky = false) {
+  homeStage = H_IDLE; holdX(); applyProfile(); xHomed = false;
+  setScreen(S_HOME); toast(m, sticky);
+}
 void homingUpdate() {
-  if (millis() - homeT0 > X_HOME_TIMEOUT_MS) { failHome("HOME TIMEOUT"); return; }
+  if (millis() - homeT0 > X_HOME_TIMEOUT_MS) { failHome("HOME TIMEOUT", true); return; }
   long p = stepX.currentPosition();
   switch (homeStage) {
     case H_SEEK_MIN:
+      if (!maxHit()) maxWasClear = true;                         // seeking MIN must never press MAX
+      if (maxHit() && (maxWasClear || labs(p - seekStartP) >= 400)) { failHome("WRONG DIRECTION", true); break; }
       if (minHit()) { stepX.setCurrentPosition(0); homeStage = H_BACKOFF_MIN; break; }
       stepX.setSpeed(-X_HOME_SPEED); stepX.runSpeed(); break;
     case H_BACKOFF_MIN:
@@ -285,10 +282,11 @@ void homingUpdate() {
       }
       stepX.setSpeed(X_HOME_SPEED); stepX.runSpeed(); break;
     case H_SEEK_MAX:
+      if (minHit()) { failHome("WRONG DIRECTION", true); break; }
       if (maxHit()) { homeTrip = p; homeStage = H_BACKOFF_MAX; break; }
       stepX.setSpeed(X_HOME_SPEED); stepX.runSpeed(); break;
     case H_BACKOFF_MAX:
-      if (p <= homeTrip - X_BACKOFF_STEPS) { xMaxSteps = homeTrip - X_BACKOFF_STEPS; homeStage = H_RETURN; break; }
+      if (p <= homeTrip - X_BACKOFF_STEPS) { shot.xmax = homeTrip - X_BACKOFF_STEPS; homeStage = H_RETURN; break; }
       stepX.setSpeed(-X_HOME_SPEED); stepX.runSpeed(); break;
     case H_RETURN:
       if (p <= 0) { finishHome(); break; }
@@ -297,336 +295,228 @@ void homingUpdate() {
   }
 }
 
-// ---------------- PLAYBACK ----------------
-int playSeg = 1;
-
-void gotoKeyframe0() {   // go to the keyframe the run starts from
-  applyProfile();
-  stepX.moveTo(clampX(kf[playStart].x)); stepY.moveTo(kf[playStart].y);
-  playStage = P_GOTO;
+// ---------------- RUNNING A SHOT ----------------
+void gotoA() {
+  stepX.setMaxSpeed(X_VMAX * 0.5f); stepY.setMaxSpeed(Y_VMAX * 0.5f);
+  stepX.moveTo(clampX(ax_)); stepY.moveTo(ay_);
+  gotoTot = fabsf((float)stepX.distanceToGo()) + fabsf((float)stepY.distanceToGo());
+  if (gotoTot < 1) gotoTot = 1;
+  runStage = R_GOTO;
 }
-void beginRun() { playT0 = millis(); playFirst = false; playStage = P_RUN; }
-void startPlay(int from = 0) {
-  if (kfCount < 2) { toast("NEED 2+ KEYFRMS"); return; }
-  if (!xHomed) { toast("HOME FIRST"); return; }
-  if (from > kfCount - 2) { toast("NO SEGMENTS"); return; }
-  playTotal = 0;
-  for (int i = from + 1; i < kfCount; i++) {
-    float d = kf[i].dur;
-    float k = cfg.ease ? 1.5f : 1.0f;
-    float vx = fabsf((float)(kf[i].x - kf[i - 1].x)) / d * k;
-    float vy = fabsf((float)(kf[i].y - kf[i - 1].y)) / d * k;
-    if (vx > 0.9f * X_VMAX || vy > 0.9f * Y_VMAX) { char b[20]; snprintf(b, sizeof b, "SEG %d TOO FAST", i); toast(b); return; }
-    playTotal += d;
-  }
-  playStart = from; playSeg = from + 1; playFirst = true;
-  scr = S_PLAY; gotoKeyframe0();
+void beginRun() {
+  runT0 = millis(); runAbort = false; slewX = slewY = 0; slewT = micros();
+  stepX.setMaxSpeed(X_VMAX); stepY.setMaxSpeed(Y_VMAX);
+  runStage = R_RUN;
 }
-void stopPlay(const char *msg) {
-  playStage = P_IDLE; holdX(); holdY(); applyProfile();
-  scr = S_MENU; cur = 1; toast(msg);
+void startRun() {
+  if (!(shot.flags & F_START) || !(shot.flags & F_END)) { toast("SET START+END"); return; }
+  if ((shot.flags & F_XMAX) && (shot.sx < 0 || shot.sx > shot.xmax || shot.ex < 0 || shot.ex > shot.xmax)) { toast("RESET START/END", true); return; }
+  float dx = fabsf((float)(shot.ex - shot.sx)), dy = fabsf((float)(shot.ey - shot.sy));
+  if (dx < 1 && dy < 1) { toast("START = END"); return; }
+  // Shortest time the motors can follow: speed <= 90% of max, and (with ease) acceleration within the limit.
+  float k = shot.ease ? 1.5f : 1.0f;
+  float tmin = fmaxf(k * dx / (0.9f * X_VMAX), k * dy / (0.9f * Y_VMAX));
+  if (shot.ease) tmin = fmaxf(tmin, fmaxf(sqrtf(6.0f * dx / X_ACC), sqrtf(6.0f * dy / Y_ACC)));
+  if (shot.dur < tmin) { char b[20]; snprintf(b, sizeof b, "MIN TIME %ds", (int)ceilf(tmin)); toast(b, true); return; }
+  ax_ = shot.sx; ay_ = shot.sy; bx_ = shot.ex; by_ = shot.ey; runPass = 0;
+  scr = S_RUN; gotoA();
 }
-void playRun() {
-  uint32_t t = millis() - playT0;
-  float ts = t / 1000.0f;
-  if (ts >= playTotal) {
-    if (cfg.loop) { gotoKeyframe0(); return; }
-    stopPlay("DONE"); return;
-  }
-  int s = playStart + 1; float start = 0;
-  while (s < kfCount - 1 && ts >= start + kf[s].dur) { start += kf[s].dur; s++; }
-  playSeg = s;
-  float dur = kf[s].dur, u = (ts - start) / dur;
-  float e = u, de = 1.0f;
-  if (cfg.ease) { e = u * u * (3 - 2 * u); de = 6 * u * (1 - u); }
-  float dx = (float)(kf[s].x - kf[s - 1].x), dy = (float)(kf[s].y - kf[s - 1].y);
-  float px = kf[s - 1].x + dx * e, py = kf[s - 1].y + dy * e;
+void stopRun(const char *msg, bool sticky) {
+  runStage = R_IDLE; runAbort = false; holdX(); holdY(); applyProfile();
+  setScreen(S_MENU, 0); toast(msg, sticky);
+}
+// Speeds are slew-limited to the acceleration setting: starts, ends and stops are always smooth ramps.
+void runStep() {
+  uint32_t t = millis() - runT0;
+  float ts = t / 1000.0f, T = shot.dur;
+  bool ending = ts >= T;
+  float dx = (float)(bx_ - ax_), dy = (float)(by_ - ay_), px, py, vx, vy;
+  if (!ending) {
+    float u = ts / T, e = u, de = 1.0f;
+    if (shot.ease) { e = u * u * (3 - 2 * u); de = 6 * u * (1 - u); }
+    px = ax_ + dx * e; py = ay_ + dy * e; vx = dx * de / T; vy = dy * de / T;
+  } else { px = bx_; py = by_; vx = vy = 0; }
   float ramp = t < PLAY_RAMP_MS ? (float)t / PLAY_RAMP_MS : 1.0f;
   float capX = fmaxf(X_VMAX * ramp, 20.0f), capY = fmaxf(Y_VMAX * ramp, 20.0f);
-  float sx = constrain(dx * de / dur * ramp + PLAY_KP * (px - stepX.currentPosition()), -capX, capX);
-  float sy = constrain(dy * de / dur * ramp + PLAY_KP * (py - stepY.currentPosition()), -capY, capY);
-  stepX.setSpeed(sx); stepX.runSpeed();
-  stepY.setSpeed(sy); stepY.runSpeed();
+  float tx = constrain(vx * ramp + PLAY_KP * (px - stepX.currentPosition()), -capX, capX);
+  float ty = constrain(vy * ramp + PLAY_KP * (py - stepY.currentPosition()), -capY, capY);
+  if (runAbort) tx = ty = 0;
+  uint32_t nu = micros(); float dt = (nu - slewT) / 1e6f; slewT = nu;
+  if (dt > 0.05f) dt = 0.05f;
+  slewX = constrain(tx, slewX - X_ACC * dt, slewX + X_ACC * dt);
+  slewY = constrain(ty, slewY - Y_ACC * dt, slewY + Y_ACC * dt);
+  stepX.setSpeed(slewX); stepX.runSpeed();
+  stepY.setSpeed(slewY); stepY.runSpeed();
+  bool still = fabsf(slewX) < 8 && fabsf(slewY) < 8;
+  if (runAbort && still) { stopRun("STOPPED"); return; }
+  if (ending) {
+    bool near = fabsf(px - stepX.currentPosition()) < 3 && fabsf(py - stepY.currentPosition()) < 3;
+    if ((still && near) || ts > T + 3.0f) {
+      if (shot.loop) {                                   // loop = back and forth until you click
+        int32_t tx_ = ax_, ty_ = ay_; ax_ = bx_; ay_ = by_; bx_ = tx_; by_ = ty_;
+        runPass++; runT0 = millis();
+      } else stopRun("DONE");
+    }
+  }
 }
-
 void motionRun() {
+  pollLimits();
   guardLimits();
-  if (homeStage != H_IDLE) { homingUpdate(); stepY.run(); return; }
-  if (playStage == P_RUN) { playRun(); return; }
+  if (homeStage != H_IDLE) { homingUpdate(); return; }
+  if (runStage == R_RUN) { runStep(); return; }
   stepX.run(); stepY.run();
-  if (playStage == P_GOTO && stepX.distanceToGo() == 0 && stepY.distanceToGo() == 0) {
-    stepX.setMaxSpeed(X_VMAX); stepY.setMaxSpeed(Y_VMAX);
-    if (playFirst && cfg.delayIdx) { delayT0 = millis(); playStage = P_DELAY; }   // delay only before the first pass
-    else beginRun();
-  } else if (playStage == P_DELAY && millis() - delayT0 >= DELAY_S[cfg.delayIdx] * 1000UL) beginRun();
+  if (runStage == R_GOTO && stepX.distanceToGo() == 0 && stepY.distanceToGo() == 0) {
+    if (shot.delayIdx && runPass == 0) { delayT0 = millis(); runStage = R_DELAY; } else beginRun();
+  } else if (runStage == R_DELAY && millis() - delayT0 >= DELAY_S[shot.delayIdx] * 1000UL) beginRun();
 }
 
-// ---------------- KEYFRAMES ----------------
-void addKeyframeHere() {
-  if (!xHomed) { toast("HOME FIRST"); return; }
-  if (kfCount >= MAX_KF) { toast("KEYFRAMES FULL"); return; }
-  kf[kfCount] = {(int32_t)stepX.currentPosition(), (int32_t)stepY.currentPosition(), kfCount == 0 ? 0.0f : DEFAULT_KF_SECONDS};
-  kfCount++; saveKeyframes();
-  char b[20]; snprintf(b, sizeof b, "KF %d SAVED", kfCount); toast(b);
+// ---------------- SETTING POSES ----------------
+void enterPose(int which) {
+  poseWhich = which; poseAxis = 0;
+  bool have = shot.flags & (which ? F_END : F_START);
+  if (have) { stepX.moveTo(clampX(which ? shot.ex : shot.sx)); stepY.moveTo(which ? shot.ey : shot.sy); }
+  setScreen(S_POSE);
 }
-void deleteKeyframe(int i) {
-  for (int k = i; k < kfCount - 1; k++) kf[k] = kf[k + 1];
-  kfCount--; if (kfCount) kf[0].dur = 0;
-  saveKeyframes();
-}
-
-// ---------------- MENUS ----------------
-void setScreen(Screen s, int c = 0) { scr = s; cur = c; top = 0; }
-
-int menuCount() {
-  switch (scr) {
-    case S_MENU: return 7;
-    case S_HOMEMENU: return 4;
-    case S_KFLIST: return kfCount + 1;
-    case S_KFACT: return 6;
-    case S_SETTINGS: return 6;
-    case S_CONFIRM: return 2;
-    default: return 0;
-  }
-}
-void menuItem(int i, char *b) {
-  static const char *MAINM[] = {"Jog / Record", "Play sequence", "Keyframes", "", "Home / Zero", "Settings", "Diagnostics"};
-  static const char *HOMEM[] = {"Home slider", "Home+measure", "Zero pan here", "Back"};
-  static const char *ACTM[] = {"", "", "Set time", "Overwrite pos", "", "Back"};
-  static const char *SPD[] = {"Slow", "Med", "Fast"};
-  b[0] = 0;
-  switch (scr) {
-    case S_MENU:
-      if (i == 3) snprintf(b, 20, "Slot: %c  %d KF", 'A' + slot, kfCount);
-      else strcpy(b, MAINM[i]);
-      break;
-    case S_HOMEMENU:
-      if (i == 0) snprintf(b, 20, "Home slider%s", xHomed ? " ok" : "");
-      else strcpy(b, HOMEM[i]);
-      break;
-    case S_KFACT:
-      if (i == 0) snprintf(b, 20, "Go to KF%d", selKF + 1);
-      else if (i == 1) snprintf(b, 20, "Play from KF%d", selKF + 1);
-      else if (i == 4) snprintf(b, 20, "Delete KF%d", selKF + 1);
-      else strcpy(b, ACTM[i]);
-      break;
-    case S_KFLIST:
-      if (i < kfCount) snprintf(b, 20, "%d:%.0fmm %.0f%c", i + 1, kf[i].x / X_STEPS_PER_MM, kf[i].y / Y_STEPS_PER_DEG, DEG_CH);
-      else strcpy(b, "Back");
-      break;
-    case S_SETTINGS:
-      if (i == 0) snprintf(b, 20, "Loop: %s", cfg.loop ? "ON" : "OFF");
-      else if (i == 1) snprintf(b, 20, "Ease: %s", cfg.ease ? "ON" : "OFF");
-      else if (i == 2) snprintf(b, 20, "Speed: %s", SPD[cfg.speed]);
-      else if (i == 3) { if (cfg.delayIdx) snprintf(b, 20, "Delay: %ds", DELAY_S[cfg.delayIdx]); else strcpy(b, "Delay: OFF"); }
-      else if (i == 4) snprintf(b, 20, "Clear slot %c", 'A' + slot);
-      else strcpy(b, "Back");
-      break;
-    default: break;
-  }
-}
-void drawMenu() {
-  if (scr == S_CONFIRM) {
-    row(0, "Clear slot %c?", 'A' + slot);
-    row(1, "%cNo, keep %cYes", cur == 0 ? '>' : ' ', cur == 1 ? '>' : ' ');
-    return;
-  }
-  int n = menuCount(); char b[24];
-  if (cur < top) top = cur;
-  if (cur > top + 1) top = cur - 1;
-  for (int i = 0; i < 2; i++) {
-    int k = top + i;
-    if (k < n) { menuItem(k, b); row(i, "%c%s", k == cur ? '>' : ' ', b); } else row(i, "");
-  }
-}
-
-void goBack() {
-  switch (scr) {
-    case S_KFACT: setScreen(S_KFLIST, selKF); break;
-    case S_CONFIRM: setScreen(S_SETTINGS, 4); break;
-    case S_JOG: setScreen(S_MENU, 0); break;
-    case S_KFLIST: setScreen(S_MENU, 2); break;
-    case S_SLOT: setScreen(S_MENU, 3); break;
-    case S_HOMEMENU: setScreen(S_MENU, 4); break;
-    case S_SETTINGS: setScreen(S_MENU, 5); break;
-    case S_DIAG: setScreen(S_MENU, 6); break;
-    case S_KFTIME: setScreen(S_KFACT, 2); break;
-    default: break;
-  }
-}
-
-void menuSelect() {
-  switch (scr) {
-    case S_MENU:
-      switch (cur) {
-        case 0: setScreen(S_JOG); break;
-        case 1: startPlay(); break;
-        case 2: setScreen(S_KFLIST); break;
-        case 3: slotSel = slot; setScreen(S_SLOT); break;
-        case 4: setScreen(S_HOMEMENU); break;
-        case 5: setScreen(S_SETTINGS); break;
-        case 6: diagPage = 0; setScreen(S_DIAG); break;
-      }
-      break;
-    case S_HOMEMENU:
-      if (cur == 0) startHome(false);
-      else if (cur == 1) startHome(true);
-      else if (cur == 2) { stepY.setCurrentPosition(0); toast("PAN ZEROED"); }
-      else goBack();
-      break;
-    case S_KFLIST:
-      if (cur < kfCount) { selKF = cur; setScreen(S_KFACT); } else goBack();
-      break;
-    case S_KFACT:
-      if (cur == 0) {
-        if (!xHomed) { toast("HOME FIRST"); break; }
-        applyProfile();
-        stepX.moveTo(clampX(kf[selKF].x)); stepY.moveTo(kf[selKF].y); toast("MOVING...");
-      } else if (cur == 1) {
-        startPlay(selKF);
-      } else if (cur == 2) {
-        if (selKF == 0) toast("START: NO TIME"); else setScreen(S_KFTIME);
-      } else if (cur == 3) {
-        kf[selKF].x = stepX.currentPosition(); kf[selKF].y = stepY.currentPosition(); saveKeyframes(); toast("OVERWRITTEN");
-      } else if (cur == 4) { deleteKeyframe(selKF); toast("DELETED"); setScreen(S_KFLIST); }
-      else goBack();
-      break;
-    case S_SETTINGS:
-      if (cur == 0) { cfg.loop ^= 1; saveSettings(); }
-      else if (cur == 1) { cfg.ease ^= 1; saveSettings(); }
-      else if (cur == 2) { cfg.speed = (cfg.speed + 1) % 3; saveSettings(); applyProfile(); }
-      else if (cur == 3) { cfg.delayIdx = (cfg.delayIdx + 1) % 4; saveSettings(); }
-      else if (cur == 4) setScreen(S_CONFIRM);
-      else goBack();
-      break;
-    case S_CONFIRM:
-      if (cur == 1) { kfCount = 0; saveKeyframes(); toast("CLEARED"); }
-      setScreen(S_SETTINGS, 4);
-      break;
-    default: break;
-  }
-}
-
-void jogMove(int d) {
-  if (jogAxis == 0) {
-    long t = clampX(stepX.targetPosition() + lroundf(d * X_STEP_MM[jogStep] * X_STEPS_PER_MM));
-    stepX.moveTo(t);
+// Slow turn = fine (0.5 mm / 0.5 deg), faster = medium, fast spin = coarse. No step setting needed.
+void poseTurn(int r) {
+  static uint32_t last = 0;
+  uint32_t now = millis(), dt = now - last; last = now;
+  int mult = (abs(r) > 2 || dt < 40) ? 20 : (dt < 110 ? 4 : 1);
+  if (poseAxis == 0) {
+    long d = lroundf(r * mult * 0.5f * X_STEPS_PER_MM);
+    long ahead = max(400L, 4 * labs(d)), pos = stepX.currentPosition();
+    stepX.moveTo(clampX(constrain(stepX.targetPosition() + d, pos - ahead, pos + ahead)));
   } else {
-    stepY.moveTo(stepY.targetPosition() + lroundf(d * Y_STEP_DEG[jogStep] * Y_STEPS_PER_DEG));
+    long d = lroundf(r * mult * 0.5f * Y_STEPS_PER_DEG);
+    long ahead = max(400L, 4 * labs(d)), pos = stepY.currentPosition();
+    stepY.moveTo(clampY(constrain(stepY.targetPosition() + d, pos - ahead, pos + ahead)));
+  }
+}
+void savePose() {
+  if (poseWhich == 0) { shot.sx = stepX.targetPosition(); shot.sy = stepY.targetPosition(); shot.flags |= F_START; }
+  else { shot.ex = stepX.targetPosition(); shot.ey = stepY.targetPosition(); shot.flags |= F_END; }
+  saveShot();
+  toast(poseWhich ? "END SAVED" : "START SAVED");
+  setScreen(S_MENU, poseWhich ? 3 : 2);                  // cursor moves on to the next setup step
+}
+
+// ---------------- MENU ----------------
+#define MENU_N 9
+void menuItem(int i, char *b) {
+  switch (i) {
+    case 0: strcpy(b, "Run shot"); break;
+    case 1: snprintf(b, 20, "Set start%s", (shot.flags & F_START) ? " ok" : ""); break;
+    case 2: snprintf(b, 20, "Set end%s", (shot.flags & F_END) ? " ok" : ""); break;
+    case 3: snprintf(b, 20, "Time: %ds", shot.dur); break;
+    case 4: snprintf(b, 20, "Ease: %s", shot.ease ? "ON" : "OFF"); break;
+    case 5: snprintf(b, 20, "Loop: %s", shot.loop ? "ON" : "OFF"); break;
+    case 6: if (shot.delayIdx) snprintf(b, 20, "Delay: %ds", DELAY_S[shot.delayIdx]); else strcpy(b, "Delay: OFF"); break;
+    case 7: strcpy(b, "Re-home"); break;
+    default: strcpy(b, "Re-measure"); break;
+  }
+}
+void menuSelect() {
+  switch (cur) {
+    case 0: startRun(); break;
+    case 1: enterPose(0); break;
+    case 2: enterPose(1); break;
+    case 3: timeBackup = shot.dur; setScreen(S_TIME); break;
+    case 4: shot.ease ^= 1; saveShot(); break;
+    case 5: shot.loop ^= 1; saveShot(); break;
+    case 6: shot.delayIdx = (shot.delayIdx + 1) % 4; saveShot(); break;
+    case 7: setScreen(S_HOME); break;
+    default: forceMeasure = true; setScreen(S_HOME); break;
   }
 }
 
 void handleInput(const Input &in) {
-  g_wantDouble = (scr == S_JOG);
+  if (toastUntil) {
+    if (toastSticky) { if (in.ev != EV_NONE) { toastUntil = 0; toastSticky = false; return; } }
+    else if (in.rot || in.ev != EV_NONE) toastUntil = 0;
+  }
   switch (scr) {
-    case S_JOG:
-      if (in.rot) jogMove(in.rot);
-      if (in.rotHeld) jogStep = constrain(jogStep + (in.rotHeld > 0 ? 1 : -1), 0, 3);
-      if (in.ev == EV_CLICK) jogAxis ^= 1;
-      else if (in.ev == EV_DOUBLE) addKeyframeHere();
-      else if (in.ev == EV_LONG) goBack();
+    case S_HOME:
+      if (in.ev == EV_CLICK) startHome(forceMeasure || !(shot.flags & F_XMAX));
+      else if (in.ev == EV_LONG) setScreen(S_DIAG);
       break;
-    case S_KFTIME: {
-      float &d = kf[selKF].dur;
-      if (in.rot) d += in.rot * 0.5f;
-      if (in.rotHeld) d += in.rotHeld * 5.0f;
-      d = constrain(d, 0.5f, 600.0f);
-      if (in.ev == EV_CLICK) { saveKeyframes(); setScreen(S_KFACT, 2); }
-      else if (in.ev == EV_LONG) { saveKeyframes(); goBack(); }
-      break; }
-    case S_SLOT: {
-      int r = in.rot + in.rotHeld;
-      if (r) slotSel = constrain((int)slotSel + (r > 0 ? 1 : -1), 0, NUM_SLOTS - 1);
-      if (in.ev == EV_CLICK) {
-        if (slotSel != slot) { loadSlot(slotSel); prefs.putUChar("slot", slot); }
-        char b[20]; snprintf(b, sizeof b, "SLOT %c LOADED", 'A' + slot); toast(b);
-        setScreen(S_MENU, 3);
-      } else if (in.ev == EV_LONG) goBack();
-      break; }
-    case S_HOMING: if (in.ev != EV_NONE) abortHome(); break;
-    case S_PLAY: if (in.ev != EV_NONE) stopPlay("STOPPED"); break;
-    case S_DIAG:
-      if (in.rot) diagPage = constrain(diagPage + (in.rot > 0 ? 1 : -1), 0, 2);
-      if (in.ev != EV_NONE) goBack();
+    case S_HOMING: if (in.ev != EV_NONE) failHome("HOMING STOPPED"); break;
+    case S_POSE:
+      if (in.rot) poseTurn(in.rot);
+      if (in.ev == EV_CLICK) { if (poseAxis == 0) poseAxis = 1; else savePose(); }
+      else if (in.ev == EV_LONG) setScreen(S_MENU, poseWhich ? 2 : 1);
       break;
-    default: {
-      int n = menuCount();
-      int rot = in.rot + in.rotHeld;
-      if (rot) cur = constrain(cur + rot, 0, n - 1);
+    case S_TIME: {
+      static uint32_t lastTurn = 0;
+      if (in.rot) {
+        bool fast = (millis() - lastTurn < 90) || abs(in.rot) > 1;
+        lastTurn = millis();
+        shot.dur = constrain((int)shot.dur + in.rot * (fast ? 10 : 1), 1, 600);
+      }
+      if (in.ev == EV_CLICK) { saveShot(); setScreen(S_MENU, 4); }
+      else if (in.ev == EV_LONG) { shot.dur = timeBackup; setScreen(S_MENU, 3); }
+      break; }
+    case S_RUN:
+      if (in.ev != EV_NONE) { if (runStage == R_RUN) runAbort = true; else stopRun("STOPPED"); }
+      break;
+    case S_DIAG: if (in.ev != EV_NONE) setScreen(S_HOME); break;
+    default:
+      if (in.rot) cur = constrain(cur + in.rot, 0, MENU_N - 1);
       if (in.ev == EV_CLICK) menuSelect();
-      else if (in.ev == EV_LONG) goBack();
-    }
   }
 }
 
 // ---------------- DRAW ----------------
-static void stepStr(char *o, float v) { if (v >= 10) snprintf(o, 8, "%.0f", v); else snprintf(o, 8, "%.1f", v); }
-
 void draw() {
+  char b[24];
   switch (scr) {
-    case S_JOG: {
-      char st[8];
-      stepStr(st, jogAxis == 0 ? X_STEP_MM[jogStep] : Y_STEP_DEG[jogStep]);
-      row(0, "%cX%8.1fmm %c", jogAxis == 0 ? '>' : ' ', xmm(), xHomed ? 'H' : '!');
-      row(1, "%cP%7.1f%c S%s", jogAxis == 1 ? '>' : ' ', ydeg(), DEG_CH, st);
-      break; }
-    case S_KFTIME:
-      row(0, "KF%d TIME", selKF + 1);
-      row(1, "%.1fs hold:5s", kf[selKF].dur);
-      break;
+    case S_HOME: row(0, "Aim pan ahead"); row(1, "then click: home"); break;
     case S_HOMING: {
-      static const char *N[] = {"", "SeekMIN", "BackOff", "SeekMAX", "BackMAX", "Return"};
-      row(0, "HOME %s", N[homeStage]);
-      row(1, "X%.0f  click:stop", xmm());
-      break; }
-    case S_PLAY:
-      if (playStage == P_GOTO) { row(0, "PLAY: to start"); row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH); }
-      else if (playStage == P_DELAY) {
-        long left = ((long)DELAY_S[cfg.delayIdx] * 1000L - (long)(millis() - delayT0) + 999) / 1000;
+      static const char *N[] = {"", "Seeking MIN", "Backing off", "Measuring", "Backing off", "Returning"};
+      row(0, "HOMING"); row(1, "%s", N[homeStage]); break; }
+    case S_POSE:
+      row(0, "%cX%6.1fmm %-5s", poseAxis == 0 ? '>' : ' ', stepX.targetPosition() / X_STEPS_PER_MM, poseWhich ? "END" : "START");
+      row(1, "%cP%6.1f%c  %s", poseAxis == 1 ? '>' : ' ', stepY.targetPosition() / Y_STEPS_PER_DEG, DEG_CH, poseAxis == 0 ? "next" : "save");
+      break;
+    case S_TIME: row(0, "SHOT TIME"); row(1, "%d s  click=ok", shot.dur); break;
+    case S_RUN:
+      if (runStage == R_GOTO) {
+        float rem = fabsf((float)stepX.distanceToGo()) + fabsf((float)stepY.distanceToGo());
+        row(0, "To start %d%%", constrain(100 - (int)(100.0f * rem / gotoTot), 0, 100));
+        row(1, "click to cancel");
+      } else if (runStage == R_DELAY) {
+        long left = ((long)DELAY_S[shot.delayIdx] * 1000L - (long)(millis() - delayT0) + 999) / 1000;
         row(0, "Start in %lds", left < 0 ? 0L : left);
-        row(1, "click = cancel");
+        row(1, "click to cancel");
       } else {
-        row(0, "P%d/%d %.0f/%.0fs", playSeg - playStart, kfCount - 1 - playStart, (millis() - playT0) / 1000.0f, playTotal);
-        row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH);
+        row(0, "%s %d/%ds", shot.loop ? "LOOP" : "RUN", (int)((millis() - runT0) / 1000), shot.dur);
+        row(1, runAbort ? "stopping..." : "click to stop");
       }
       break;
-    case S_SLOT: {
-      char line[24] = ""; 
-      for (int i = 0; i < NUM_SLOTS; i++) {
-        char c[5]; if (i == slotSel) snprintf(c, sizeof c, "[%c]", 'A' + i); else snprintf(c, sizeof c, " %c ", 'A' + i);
-        strcat(line, c);
-      }
-      row(0, "%s", line);
-      row(1, "%d KF%s", slotCount(slotSel), slotSel == slot ? " (active)" : "");
-      break; }
     case S_DIAG:
-      if (diagPage == 0) {
-        row(0, "MIN:%d MAX:%d", minHit(), maxHit());
-        row(1, "SW:%d  turn=page", digitalRead(PIN_ENC_SW));
-      } else if (diagPage == 1) {
-        row(0, "CLK%d DT%d SW%d", digitalRead(PIN_ENC_CLK), digitalRead(PIN_ENC_DT), digitalRead(PIN_ENC_SW));
-        row(1, "Enc %ld", (long)encTotal);
-      } else {
-        row(0, "X steps %ld", stepX.currentPosition());
-        row(1, "Y steps %ld", stepY.currentPosition());
-      }
+      row(0, "MIN:%d MAX:%d", minHit(), maxHit());
+      row(1, "CLK%d DT%d SW%d", digitalRead(PIN_ENC_CLK), digitalRead(PIN_ENC_DT), digitalRead(PIN_ENC_SW));
       break;
-    default: drawMenu();
+    default:
+      if (cur < top) top = cur;
+      if (cur > top + 1) top = cur - 1;
+      for (int i = 0; i < 2; i++) {
+        int k = top + i;
+        if (k < MENU_N) { menuItem(k, b); row(i, "%c%s", k == cur ? '>' : ' ', b); } else row(i, "");
+      }
   }
   if ((int32_t)(toastUntil - millis()) > 0) row(1, "%s", toastMsg);
-  // Live limit indicator on every screen (top-right corner): < = MIN pressed, > = MAX pressed, # = both
-  bool mn = minHit(), mx = maxHit();
+  bool mn = minHit(), mx = maxHit();                          // corner marker: < MIN pressed, > MAX pressed
   if (mn || mx) want[0][LCD_COLS - 1] = (mn && mx) ? '#' : (mn ? '<' : '>');
 }
 
 // ---------------- SETUP / LOOP ----------------
 void setup() {
   Serial.begin(115200);
-  pinMode(PIN_ENC_CLK, INPUT_PULLUP);
-  pinMode(PIN_ENC_DT, INPUT_PULLUP);
-  pinMode(PIN_ENC_SW, INPUT_PULLUP);
-  pinMode(PIN_LIMIT_MIN, INPUT_PULLUP);
-  pinMode(PIN_LIMIT_MAX, INPUT_PULLUP);
+  pinMode(PIN_ENC_CLK, INPUT_PULLUP); pinMode(PIN_ENC_DT, INPUT_PULLUP); pinMode(PIN_ENC_SW, INPUT_PULLUP);
+  pinMode(PIN_LIMIT_MIN, INPUT_PULLUP); pinMode(PIN_LIMIT_MAX, INPUT_PULLUP);
+  limMin.raw = limMin.state = (digitalRead(PIN_LIMIT_MIN) == LIMIT_ACTIVE_LEVEL);
+  limMax.raw = limMax.state = (digitalRead(PIN_LIMIT_MAX) == LIMIT_ACTIVE_LEVEL);
+  limMin.t = limMax.t = micros();
   encPrev = (digitalRead(PIN_ENC_CLK) << 1) | digitalRead(PIN_ENC_DT);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_CLK), encISR, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_DT), encISR, CHANGE);
@@ -634,30 +524,28 @@ void setup() {
   stepX.setPinsInverted(X_DIR_INVERT, false, false);
   stepY.setPinsInverted(Y_DIR_INVERT, false, false);
   stepX.setMinPulseWidth(4); stepY.setMinPulseWidth(4);
-
-  loadAll();
+  loadShot();
   applyProfile();
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(400000);
+  Wire.setTimeOut(3);
   uint8_t addr = i2cPresent(0x27) ? 0x27 : (i2cPresent(0x3F) ? 0x3F : 0);
   memset(want, ' ', sizeof want); memset(shown, 0, sizeof shown);
-  if (addr) {
-    lcd = new LiquidCrystal_I2C(addr, LCD_COLS, LCD_ROWS);
-    lcd->init(); lcd->backlight(); lcd->clear();
-  } else Serial.println("No LCD found - running headless");
-
-  row(0, "MOTION RIG"); row(1, "Slot %c: %d KF", 'A' + slot, kfCount);
-  for (int i = 0; i < 20; i++) { lcdFlush(100); delay(40); }
-  uint32_t t0 = millis(); while (millis() - t0 < 1000) { lcdFlush(100); }
+  if (addr) { lcd = new LiquidCrystal_I2C(addr, LCD_COLS, LCD_ROWS); lcdAddr = addr; lcd->init(); lcd->backlight(); lcd->clear(); }
+  else Serial.println("No LCD found - running headless");
+  row(0, "MOTION RIG"); row(1, "Ready to set up");
+  uint32_t t0 = millis(); while (millis() - t0 < 1200) { lcdFlush(100); }
 }
 
 void loop() {
   motionRun();
   Input in = pollInput();
   handleInput(in);
-  bool busy = stepX.isRunning() || stepY.isRunning() || homeStage != H_IDLE || playStage != P_IDLE;
+  if (!xHomed && homeStage == H_IDLE && scr != S_HOME && scr != S_DIAG) setScreen(S_HOME);   // always re-home first
+  bool busy = stepX.isRunning() || stepY.isRunning() || homeStage != H_IDLE || runStage != R_IDLE;
   uint32_t now = millis();
   if (now - lastDraw >= (busy ? 200UL : 50UL)) { lastDraw = now; draw(); }
+  lcdHealth(busy);
   lcdFlush(busy ? 2 : 16);
 }

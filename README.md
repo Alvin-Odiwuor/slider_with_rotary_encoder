@@ -1,12 +1,18 @@
 # Motion Rig — Slider + Pan Controller
 
-Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop switches, and a **pan head (Y)**. You control everything with one rotary encoder and a 16×2 I²C LCD. You can jog the rig to positions, save them as keyframes with timings, and play the move back smoothly, once or on a loop.
+Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop switches, and a **pan head (Y)**. You control everything with one rotary encoder and a 16×2 I²C LCD.
+
+The rig does **one shot**: it moves smoothly from a **START** pose to an **END** pose, with the slider and pan moving together, over a time you choose. The whole workflow is:
+
+> **Power on → aim the pan → click to home → set START → set END → set TIME → Run.**
 
 Highlights:
 
-- **5 sequence slots (A–E)**, each holding up to 20 keyframes, kept in flash.
-- **Start delay** (off, 3, 5 or 10 s) between reaching the start position and the move beginning.
-- **Play from here:** start playback from any keyframe instead of the first.
+- **One knob, three gestures:** turn = move / scroll, click = select / next, hold = cancel.
+- **No step sizes to set:** turn slowly for fine moves and spin fast for big ones.
+- **Ease in/out, back-and-forth loop, start delay** (off, 3, 5 or 10 s).
+- **Checks before every run:** a shot that is too fast for the motors is refused, with the shortest time that would work.
+- **Safe by default:** the rig can't run until homed, a limit-switch hit forces a re-home, and homing stops if the motor runs the wrong way. Stops are always smooth, and the controller keeps running if the LCD drops off the bus.
 
 - **MCU:** ESP32-C3 SuperMini
 - **Framework:** Arduino on PlatformIO (`espressif32`)
@@ -21,8 +27,8 @@ Highlights:
 3. [Building and flashing](#building-and-flashing)
 4. [First power-up checklist](#first-power-up-checklist)
 5. [Controls](#controls)
-6. [Menu reference](#menu-reference)
-7. [Typical workflow](#typical-workflow)
+6. [Using the rig](#using-the-rig)
+7. [Screen reference](#screen-reference)
 8. [How it works](#how-it-works)
 9. [Configuration constants](#configuration-constants)
 10. [Persistent storage](#persistent-storage)
@@ -41,7 +47,7 @@ Highlights:
 | Stepper Y (pan) | 200 steps/rev, 16× microstep, **4:1 reduction** → 12 800 steps per 360°. |
 | 2 × limit switches | MIN and MAX ends of the slider. 3-wire modules or bare switches to GND. |
 | KY-040 rotary encoder | With push button. |
-| 16×2 HD44780 LCD + I²C backpack | Auto-detected at `0x27` or `0x3F`. A 16×4 panel also works if you change `LCD_ROWS`/`LCD_ROW_OFFSET`, but the screens are laid out for 2 lines. |
+| 16×2 HD44780 LCD + I²C backpack | Auto-detected at `0x27` or `0x3F`. |
 
 If your mechanics are different (pulley, gearing, microstepping), change the constants in [Configuration constants](#configuration-constants).
 
@@ -71,6 +77,7 @@ If your mechanics are different (pulley, gearing, microstepping), change the con
   - Don't hold the encoder button down while the board powers up or resets.
   - Anything on GPIO8/GPIO9 must not pull them LOW at boot. Standard I²C pull-ups are fine.
 - **GPIO20/21** are the C3's UART0 pins. They're free for the limit switches because serial output goes over USB instead (see `ARDUINO_USB_CDC_ON_BOOT` below).
+- **Cable routing.** Keep the SDA/SCL and limit-switch wires short and away from the motor cables. The firmware filters out noise, but less noise is always better.
 
 ---
 
@@ -127,163 +134,188 @@ The board should now enumerate as a USB serial device (Espressif VID `303A`). Re
 
 ## First power-up checklist
 
-Do these in order before you run a real move:
+Do these in order before you film anything:
 
-1. **LCD.** The splash screen should read `MOTION RIG / Slot A: N KF` (the active slot and its keyframe count). If the screen is blank, see [Troubleshooting](#lcd-shows-nothing).
-2. **Diagnostics** (`Main menu → Diagnostics`, turn the encoder to change page):
-   - Page 1: `MIN:0 MAX:0` with nothing pressed. Press each switch by hand: its value should go to `1`. If the values are inverted, set `LIMIT_ACTIVE_LEVEL` to `HIGH`.
-   - Page 2: turn the encoder. `Enc` should change by **1 per click**. If it changes by 2 per click or skips, set `ENC_TRANSITIONS_PER_DETENT` to `2`. If it counts the wrong way, set `ENC_INVERT`.
-3. **Directions.** In `Jog / Record`, turn clockwise in small steps. The slider should move **away from MIN**, and the pan should rotate the way you think of as positive. Fix either with `X_DIR_INVERT` / `Y_DIR_INVERT`.
-4. **Home.** `Home / Zero → Home+measure`. The slider should go to MIN, back off, travel to MAX, back off, and return to 0. Its usable length is then saved.
-5. **Pan zero.** Point the pan head where you want 0° and pick `Home / Zero → Zero pan here`.
+1. **LCD.** The display shows `MOTION RIG / Ready to set up` for about a second, then `Aim pan ahead / then click: home`. If it stays blank, see [Troubleshooting](#lcd-shows-nothing).
+2. **Diagnostics.** On the `Aim pan ahead` screen, **hold** the button to open Diagnostics:
+   - `MIN:0 MAX:0` with nothing pressed. Press each switch by hand: its value should go to `1`. If the values are inverted, set `LIMIT_ACTIVE_LEVEL` to `HIGH`.
+   - `CLK DT SW` show the raw encoder pins. `SW` should go to `0` while the button is pressed. Turn slowly: `CLK` and `DT` should both toggle.
+
+   Click to go back.
+3. **First home.** Click. Because no travel length has been saved yet, the rig goes to MIN, then runs to MAX to **measure the travel**, then returns to MIN. It should finish with `READY`.
+   - If it stops with `WRONG DIRECTION`, flip `X_DIR_INVERT` (or the switches are swapped).
+4. **Directions.** Open **Set start**. Turn the knob clockwise: the slider should move **away from MIN**. Click, then turn: the pan should rotate the way you think of as positive. Fix either with `X_DIR_INVERT` / `Y_DIR_INVERT`.
+5. **Encoder count.** If one click of the knob moves twice as far as expected, or skips, set `ENC_TRANSITIONS_PER_DETENT` to `2`. If it moves the wrong way, set `ENC_INVERT`.
 
 ---
 
 ## Controls
 
-There is one encoder with a push button. What each input does depends on the screen:
+One encoder with a push button. Everywhere:
 
-| Input | Menus | Jog / Record | KF time edit | Diagnostics | Homing / Play |
-|---|---|---|---|---|---|
-| Turn | Move cursor | Move active axis by step size | ±0.5 s | Change page | — |
-| Hold + turn | Move cursor | Change step size | ±5 s | — | — |
-| Click | Select | Toggle axis (slider ⇄ pan) | Save and return | Exit | Abort / stop |
-| Double-click | — | **Save keyframe here** | — | — | — |
-| Long press (≥ 0.7 s) | Back | Back to main menu | Save and back | Exit | Abort / stop |
+| Gesture | Meaning |
+|---|---|
+| **Turn** | Move the axis being set, scroll the menu, or change the time. |
+| **Click** | Select / next / save. |
+| **Hold** (≥ 0.7 s) | Cancel and go back. On the `Aim pan ahead` screen it opens Diagnostics. |
 
-Double-click only works on the Jog screen. Everywhere else a click responds immediately, with no double-click delay.
+- There is no double-click. Every click acts straight away.
+- Turning while the button is held down never counts as a click.
+- During homing or a run, **any** click stops it.
 
 ### Screen indicators
 
-- **Toast messages** (e.g. `KF 3 SAVED`, `HOME FIRST`, `LIMIT MIN`) replace the second line for 1.5 s.
+- **Pop-up messages** (e.g. `START SAVED`, `READY`) replace the second line for about 1.2 s. Turning or pressing clears them early.
+- **Error pop-ups** that you must not miss stay on screen until you click. These are `LIMIT HIT-REHOME`, `WRONG DIRECTION`, `HOME TIMEOUT`, `LIMIT WIRING?`, `RESET START/END` and `MIN TIME Ns`. That click only dismisses the message and does nothing else.
 - **Limit indicator.** The top-right character of every screen shows `<` while MIN is pressed, `>` while MAX is pressed, and `#` when both are pressed (a wiring fault).
-- **Menus** have no title line: the 2-line display shows two items at a time, and `>` marks the selected one. Scroll to see the rest.
 
 ---
 
-## Menu reference
+## Using the rig
+
+### 1. Home
 
 ```
-MAIN MENU
-├── Jog / Record
-├── Play sequence         (plays the active slot from KF 1)
-├── Keyframes             (keyframes of the active slot)
-│   ├── 1: <x>mm <y>°  →  Go to KFn | Play from KFn | Set time | Overwrite pos | Delete KFn | Back
-│   ├── 2: ...
-│   └── Back
-├── Slot: A  3 KF         (pick the active sequence slot, A–E)
-├── Home / Zero
-│   ├── Home slider [ok]  (seek MIN, set X = 0; shows "ok" once homed)
-│   ├── Home+measure      (seek MIN, then MAX, save travel length)
-│   ├── Zero pan here     (current pan = 0°)
-│   └── Back
-├── Settings
-│   ├── Loop: ON/OFF
-│   ├── Ease: ON/OFF
-│   ├── Speed: Slow/Med/Fast
-│   ├── Delay: OFF/3s/5s/10s
-│   ├── Clear slot A      → confirm: No, keep / Yes
-│   └── Back
-└── Diagnostics
+Aim pan ahead
+then click: home
 ```
 
-### Jog / Record
+This screen appears at power-up and **whenever the slider isn't homed**. The firmware returns to it on its own after a limit-switch hit, for example.
+
+1. **Point the pan head straight ahead**, at the same reference every time. The pan has no switch, so **wherever it points when you click becomes 0°**.
+2. **Click.** The slider homes to MIN. If no travel length is saved, or you chose **Re-measure**, it also runs to MAX to measure the travel first.
+3. When it's done you see `READY` and the main menu.
+
+A click during homing stops it (`HOMING STOPPED`) and returns you to this screen.
+
+### 2. Set START and END
+
+Choose **Set start** (or **Set end**) from the menu.
 
 ```
->X   123.0mm H
- P   45.0° S2.0
+>X  123.4mm START
+ P   12.0°  next
 ```
 
-- The `>` marks the active axis (X = slider, P = pan). Click to switch.
-- The character after `mm` is `H` when the slider is homed and `!` when it isn't.
-- `S` is the current step size for the active axis: slider **0.5 / 2 / 10 / 50 mm**, pan **0.5 / 2 / 10 / 45°**.
-- Turns add up: spinning fast queues several steps, and the axis accelerates to cover them.
-- Double-click saves the current X/Y as a new keyframe. This requires the slider to be homed. Keyframes go into the **active slot**, up to 20 per slot.
+1. If that pose was already saved, the rig first drives to it, so you can fine-tune instead of starting over.
+2. **Turn** to move the slider (`>` on the X line).
+3. **Click** to switch to the pan (`>` on the P line). The right-hand hint changes from `next` to `save`.
+4. **Turn** to move the pan.
+5. **Click** again to save (`START SAVED` / `END SAVED`). The menu cursor jumps to the next setup step: after START it moves to **Set end**, after END to **Time**.
 
-### Keyframes
+**Hold** at any time to cancel without saving. The rig stays where it is.
 
-Each keyframe stores an X position, a Y position, and a **duration**: the number of seconds playback takes to travel *from the previous keyframe to this one*. Keyframe 1 is the start point and has no duration.
+**Speed-sensitive knob.** There's no step size to set, because the knob works it out from how fast you turn:
 
-| Action | Effect |
+| How you turn | Slider per click | Pan per click |
+|---|---|---|
+| Slowly | 0.5 mm | 0.5° |
+| Medium (clicks < 110 ms apart) | 2 mm | 2° |
+| Fast spin (clicks < 40 ms apart) | 10 mm | 10° |
+
+The target can only run a short way ahead of the carriage, so a hard spin can't queue up a long move. The slider is kept inside its measured travel, and the pan is limited to **±350°** so the cables can't wind up.
+
+### 3. Set the time
+
+Choose **Time: Ns**.
+
+```
+SHOT TIME
+10 s  click=ok
+```
+
+- Turn slowly to change the time by **1 s** per click; spin fast to change it by **10 s** per click. Range **1–600 s**, default 10 s.
+- **Click** saves; the cursor moves on to **Ease**.
+- **Hold** cancels and restores the previous time.
+
+### 4. Options
+
+These are on the menu; click to toggle or cycle them. Each change is saved at once.
+
+| Option | Effect |
 |---|---|
-| Go to | Moves the rig to that keyframe at the current Speed setting (requires homing). |
-| Play from | Plays the sequence **starting at this keyframe** instead of KF 1. See [Play from here](#play-from-here). |
-| Set time | Edits the duration (0.5–600 s, default 5 s). The screen shows `KFn TIME` / `5.0s hold:5s`. Not available on keyframe 1. |
-| Overwrite pos | Replaces the stored position with where the rig is now. |
-| Delete | Removes the keyframe. If you delete keyframe 1, the next keyframe becomes the start. |
+| **Ease: ON/OFF** | ON (default): the move starts and ends gently (smoothstep). OFF: constant speed from start to end. |
+| **Loop: ON/OFF** | ON: after reaching END, the rig goes back to START over the same time, then forward again, until you click. OFF: one pass, then `DONE`. |
+| **Delay: OFF/3s/5s/10s** | Countdown after the rig reaches START, before the move begins. Gives you time to start recording or step out of frame. It only runs before the **first** pass of a loop. |
 
-Every change is saved to flash immediately, in the active slot.
+### 5. Run
 
-### Play from here
-
-`Keyframes → KF n → Play from KFn` runs the move from keyframe *n* to the end, skipping the earlier segments. It's handy for re-shooting or checking the second half of a long move without waiting through the first.
-
-- The rig first drives to KF *n*, then the start delay runs (if set), then the timed move.
-- Only the segments after KF *n* are speed-checked, and the playback screen counts segments and time from KF *n*. For example, playing from KF 3 of 5 shows `P1/2`.
-- With **Loop** on, each repeat goes back to KF *n*, not KF 1.
-- You can't play from the last keyframe, because there is nothing after it (`NO SEGMENTS`).
-
-### Sequence slots
-
-There are **5 slots, A–E**. Each one holds its own sequence of up to 20 keyframes, so you can keep several moves stored and switch between them.
+Choose **Run shot**. The rig first checks the shot (see [Run checks](#run-checks)), then goes through three screens:
 
 ```
- A [B] C  D  E
-3 KF (active)
+To start 62%          Start in 4s           RUN 3/10s
+click to cancel       click to cancel       click to stop
 ```
 
-- `Main menu → Slot` opens the picker. Turn to move the `[ ]` cursor; the second line shows how many keyframes that slot holds, and `(active)` marks the current one.
-- Click to make the highlighted slot active (`SLOT B LOADED`). Long-press to leave without changing.
-- Jog/Record, Keyframes, Play sequence and Clear slot all work on the **active slot** only.
-- The active slot is remembered across power cycles. The splash screen shows it (`Slot B: 3 KF`).
-- Switching slots doesn't move the rig. All slots share the same home and pan zero, because keyframes are stored as absolute positions.
+1. **To start:** drives to START at half speed. The percentage is how much of that move is done.
+2. **Start in:** the countdown, if a delay is set.
+3. **RUN** (or **LOOP**): the shot itself, with elapsed and total seconds.
 
-### Settings
+A click during the first two screens cancels straight away. A click during the shot makes the rig **decelerate smoothly** to rest (`stopping...`), then shows `STOPPED`. When a one-pass shot finishes, the rig glides to rest exactly on END and shows `DONE`.
 
-| Setting | Effect |
+### Re-home and Re-measure
+
+- **Re-home:** goes back to the `Aim pan ahead` screen. Use it if you think steps were lost, or to set a new pan zero.
+- **Re-measure:** the same, but the next home also measures the slider travel again. Use it after moving the rails or the switches.
+
+Both take you to the home screen, which has no "back": once you pick one, you have to home (click) to return to the menu.
+
+---
+
+## Screen reference
+
+### Main menu
+
+The 2-line display shows two items at a time; `>` marks the selected one. Turn to scroll, click to select. There's no "back" from the main menu, because it's the top level.
+
+| Item | Action |
 |---|---|
-| **Loop** | Playback returns to its start keyframe and repeats until you stop it. |
-| **Ease** | Each segment eases in and out (smoothstep) instead of moving at constant speed. Peak speed is 1.5× the segment average. |
-| **Speed** | Slow 25 % / Med 50 % / Fast 100 % of max speed. Applies to **jogging, Go to, and the move to the start of playback**. Timed playback ignores it, because the keyframe durations set the speed. |
-| **Delay** | Countdown after the rig reaches the start keyframe and before the timed move begins: OFF / 3 / 5 / 10 s. Click to cycle through them. Gives you time to start recording or step out of frame. It only runs before the **first** pass, so loops repeat straight away. |
-| **Clear slot X** | Deletes every keyframe in the active slot, after a confirmation (`Clear slot A?` / `>No, keep  Yes`). Other slots aren't touched. |
+| `Run shot` | Check and run the shot. |
+| `Set start` / `Set start ok` | Set the START pose (`ok` once saved). |
+| `Set end` / `Set end ok` | Set the END pose. |
+| `Time: 10s` | Set the shot duration. |
+| `Ease: ON` | Toggle ease in/out. |
+| `Loop: OFF` | Toggle back-and-forth looping. |
+| `Delay: OFF` | Cycle the start delay: OFF → 3 s → 5 s → 10 s. |
+| `Re-home` | Home again (and set a new pan zero). |
+| `Re-measure` | Home again and re-measure the slider travel. |
 
-### Homing and playback screens
+### Homing
 
 ```
-HOME SeekMIN          Start in 4s           P2/3 7/15s
-X0  click:stop        click = cancel        X 123.4 P   45°
+HOMING
+Seeking MIN
 ```
 
-- **Homing** shows the current stage (`SeekMIN`, `BackOff`, `SeekMAX`, `BackMAX`, `Return`) and the X position in mm.
-- **Playback** goes through three screens:
-  1. `PLAY: to start`, with live X/pan, while the rig drives to the start keyframe.
-  2. `Start in Ns` if a start delay is set. A click cancels.
-  3. The running move: current segment of the total, elapsed and total seconds, and live X (mm) and pan (°).
+Stages: `Seeking MIN` → `Backing off` → (when measuring) `Measuring` → `Backing off` → `Returning`.
 
 ### Diagnostics
 
-Turn the encoder to flip between three pages. Any button press exits.
+From the `Aim pan ahead` screen, **hold** the button. Any press returns to the home screen.
 
-| Page | Line 1 | Line 2 |
-|---|---|---|
-| 1 | `MIN:0 MAX:0` (limit switches) | `SW:1  turn=page` (encoder button) |
-| 2 | `CLK1 DT1 SW1` (raw encoder pins) | `Enc 42` (running detent count) |
-| 3 | `X steps 1600` | `Y steps 0` |
+```
+MIN:0 MAX:0
+CLK1 DT1 SW1
+```
 
----
+Line 1 shows the debounced limit switches. Line 2 shows the raw encoder pins.
 
-## Typical workflow
+### Messages
 
-1. Power on, then **Home / Zero → Home slider**. Use **Home+measure** the first time, or after you change the rails.
-2. **Zero pan here** to point the pan head at its reference.
-3. **Slot:** pick an empty slot (or the one you want to overwrite, after **Settings → Clear slot**).
-4. **Jog / Record:** move to the start framing and double-click (KF 1).
-5. Move to the next framing and double-click (KF 2). Repeat for as many as you need.
-6. **Keyframes → KF n → Set time** to set how long each segment takes.
-7. Optional: **Settings**, to turn on Ease and/or Loop, or set a start Delay.
-8. **Play sequence.** The rig drives to KF 1, counts down the delay, then runs the timed move. Press the button at any time to stop.
-9. To redo just part of the move, use **Keyframes → KF n → Play from KFn**.
+| Message | Meaning / what to do |
+|---|---|
+| `READY` | Homing finished. |
+| `START SAVED` / `END SAVED` | Pose saved. |
+| `SET START+END` | Both poses must be set before a run. |
+| `START = END` | The two poses are the same; there's nothing to move. |
+| `MIN TIME Ns` | The shot is too fast for the motors. Set the time to at least *N* seconds, or turn Ease off (ease needs more peak speed). *(Stays until clicked.)* |
+| `RESET START/END` | START or END lies outside the measured travel, probably after a Re-measure. Set them again. *(Stays until clicked.)* |
+| `STOPPED` / `DONE` | The run was stopped / finished. |
+| `HOMING STOPPED` | You clicked during homing. |
+| `LIMIT HIT-REHOME` | A limit switch was hit while moving. The rig stopped and must be re-homed. *(Stays until clicked.)* |
+| `WRONG DIRECTION` | Homing reached the wrong switch. Flip `X_DIR_INVERT` or swap the MIN/MAX switch wires. *(Stays until clicked.)* |
+| `HOME TIMEOUT` | No switch was found within 5 minutes. Check the switch and the X direction. *(Stays until clicked.)* |
+| `LIMIT WIRING?` | Both switches read as pressed. Check wiring or `LIMIT_ACTIVE_LEVEL`. *(Stays until clicked.)* |
 
 ---
 
@@ -293,62 +325,104 @@ Turn the encoder to flip between three pages. Any button press exits.
 
 `loop()` runs these steps and never blocks:
 
-1. `motionRun()` checks the limit switches, then advances homing, playback, or normal point-to-point moves.
-2. `pollInput()` debounces the button, works out click / double / long press, and reads the encoder.
-3. `handleInput()` passes the input to the current screen.
-4. `draw()` redraws the screen buffer every 50 ms (idle) or every 200 ms (while moving).
-5. `lcdFlush()` sends only the characters that changed. It is limited to **2 I²C writes per loop while moving** and 16 while idle, so the LCD never delays step pulses.
+1. `motionRun()` samples and debounces the limit switches (`pollLimits()`), acts on any trip (`guardLimits()`), then advances homing, the shot, or normal point-to-point moves.
+2. `pollInput()` debounces the button, works out click / hold, and reads the encoder.
+3. `handleInput()` deals with pop-up dismissal, then passes the input to the current screen.
+4. If the slider isn't homed (and isn't homing), the screen is forced back to `Aim pan ahead`. Diagnostics is the one exception.
+5. `draw()` redraws the screen buffer every 50 ms (idle) or every 200 ms (while moving).
+6. `lcdHealth()` re-probes a failed LCD once a second, **only while idle**.
+7. `lcdFlush()` sends only the characters that changed. It is limited to **2 I²C writes per loop while moving** and 16 while idle, so the LCD never delays step pulses.
 
 ### Encoder
 
-Both encoder pins trigger an interrupt on every edge. A quadrature lookup table decodes the direction, which rejects contact bounce. Counts accumulate in an ISR-safe accumulator and become whole detents (`ENC_TRANSITIONS_PER_DETENT`). Turning while the button is held is reported separately (`rotHeld`) and stops the press from counting as a click.
+Both encoder pins trigger an interrupt on every edge. A quadrature lookup table decodes the direction, which rejects contact bounce. Counts accumulate in an ISR-safe accumulator and become whole detents (`ENC_TRANSITIONS_PER_DETENT`). The time between detents decides the fine / medium / coarse step when setting poses, and 1 s / 10 s when setting the time.
 
 ### Homing (X only)
 
-This is a non-blocking state machine running at `X_HOME_SPEED` (1000 steps/s ≈ 12.5 mm/s):
+This is a non-blocking state machine running at `X_HOME_SPEED` (1200 steps/s ≈ 15 mm/s):
 
 ```
+(pan position := 0°)
 SEEK_MIN → BACKOFF_MIN (3 mm, until switch releases) → X = 0
-   └─ measure only: SEEK_MAX → BACKOFF_MAX → save xMax = trip − 3 mm → RETURN to 0
+   └─ measure: SEEK_MAX → BACKOFF_MAX → save travel = trip − 3 mm → RETURN to 0
 ```
 
+- **Measuring happens automatically** when no travel is saved: on the first ever home, after a MAX hit, or after **Re-measure**.
 - If both switches read as pressed at the start, it refuses to run (`LIMIT WIRING?`).
-- It times out after 120 s (`HOME TIMEOUT`).
-- Any button press aborts (`HOMING ABORT`).
+- **Wrong-direction guard.** When seeking MIN, the slider must never reach MAX. If MAX is pressed after it was clear, or after the slider has moved 5 mm, homing stops at once (`WRONG DIRECTION`). The same happens if MIN is hit while seeking MAX.
+- It times out after 5 minutes (`HOME TIMEOUT`).
 
-### Soft and hard limits
+### Limits
 
-- **Soft limits.** Once homed, every X target is clamped to ≥ 0. After a *measured* home, X is also clamped to ≤ `xMax`.
-- **Hard limits** (`guardLimits()`). If a switch is pressed while X is moving towards it, X stops instantly and you see `LIMIT MIN`/`LIMIT MAX`. Playback stops too. You can still move *away* from a pressed switch.
+- **Soft limits.** Once homed, the slider is clamped to 0 … measured travel. The pan is always clamped to ±`PAN_LIMIT_DEG` (350°).
+- **Debounced switches.** A switch has to read pressed for 3 ms (`LIMIT_PRESS_US`) before it counts, and released for 10 ms (`LIMIT_RELEASE_US`). A noise spike from the motor wires can't abort a take.
+- **Hard limits** (`guardLimits()`). The soft limits keep a homed slider off the switches, so a switch hit while moving towards it means steps were lost: the carriage was bumped, stalled, or moved by hand. Then:
+  - X stops instantly. A run stops too.
+  - The slider is marked **not homed** (`LIMIT HIT-REHOME`), and the rig returns to the `Aim pan ahead` screen.
+  - If it was **MAX** and a travel was saved, the travel is erased, so the next home re-measures it.
+- You can still move *away* from a pressed switch.
 
-### Playback
+### Run checks
 
-Playback runs from a start keyframe (`playStart`): KF 1 for **Play sequence**, KF *n* for **Play from KFn**.
+Before moving, **Run shot** refuses to start (with a message) unless:
 
-1. **Pre-check.** At least 2 keyframes and a homed slider are required, and there must be at least one segment after the start keyframe. For each remaining segment, the firmware works out the speed needed (×1.5 when Ease is on). If any segment needs more than 90 % of `X_VMAX`/`Y_VMAX`, playback refuses to start and shows `SEG n TOO FAST`. Give that segment more time.
-2. **GOTO.** A normal accelerated move to the start keyframe.
-3. **DELAY.** On the first pass only, if `Delay` is set, the firmware waits that many seconds (non-blocking) with a countdown on screen.
-4. **RUN.** Time-based tracking. For the current time *t*, the firmware computes where each axis *should* be (linear, or smoothstep with Ease). It then sets each motor's speed to
+1. START and END are both set (`SET START+END`).
+2. With a measured travel, both poses are inside it (`RESET START/END`).
+3. START and END differ (`START = END`).
+4. The time is long enough for the motors (`MIN TIME Ns`). The shortest allowed time is the larger of:
+   - **Speed:** peak speed ≤ 90 % of `X_VMAX`/`Y_VMAX`. With Ease on, the peak is 1.5× the average.
+   - **Acceleration (Ease on):** the smoothstep's peak acceleration, 6 × distance / T², must stay within `X_ACC`/`Y_ACC`. That gives T ≥ √(6 × distance / acceleration).
+
+### The shot
+
+1. **GOTO.** An accelerated move to START at 50 % of max speed.
+2. **DELAY.** On the first pass only, if set, a non-blocking countdown.
+3. **RUN.** Time-based tracking. For the current time *t*, the firmware computes where each axis *should* be: linear, or smoothstep `3u² − 2u³` with Ease. It then sets each motor's speed to
 
    `feed-forward velocity + PLAY_KP × (ideal position − actual position)`
 
-   capped at the axis maximum. This keeps both axes in step with the clock and with each other over long moves. For the first second (`PLAY_RAMP_MS`), speed builds up gradually so the start doesn't jerk.
-5. **End.** The rig stops with `DONE`. With Loop on, it goes back to the start keyframe and repeats straight away, without the delay.
+   capped at the axis maximum. This keeps both axes in step with the clock and with each other. For the first second (`PLAY_RAMP_MS`), speed builds up gradually.
+
+   **Slew limiting.** The speed actually sent to each motor can change by no more than `X_ACC`/`Y_ACC` per second. So starts, stops and the turn-around in Loop mode are always ramps, never jolts.
+4. **End.** When the time is up, both axes glide to rest on END (with a 3 s safety timeout). One pass → `DONE`. With Loop on, START and END swap and the next pass begins.
+5. **User stop.** A click while running sets both target speeds to zero. The slew limiter decelerates the rig smoothly, and it shows `STOPPED` once it's still.
 
 ### LCD
 
-At boot the firmware scans I²C for `0x27`, then `0x3F`. If it finds neither, it runs **headless**: everything still works and `No LCD found - running headless` is printed on serial. Row addresses use the standard 16×2 offsets (`0x00, 0x40`). `row()` ignores writes to rows beyond `LCD_ROWS`.
+At boot the firmware scans I²C for `0x27`, then `0x3F`. If it finds neither, it runs **headless**: everything still works (if you can't see the screen) and `No LCD found - running headless` is printed on serial.
+
+**If the LCD fails mid-shoot** (loose wire, noise on the bus), the motion keeps running:
+
+- Every I²C call is limited to 3 ms (`Wire.setTimeOut(3)`), so a dead bus can't freeze the loop.
+- If a screen update takes far longer than normal, the LCD is marked failed and nothing more is sent to it.
+- Once the rig is idle, the firmware probes the LCD once a second. When it answers again, it is re-initialised and redrawn.
+
+### Safety summary
+
+| Risk | Protection |
+|---|---|
+| Running before the rig knows where it is | Every screen except Diagnostics is blocked until homed. |
+| Lost steps (bump, stall, hand-moved) | Any limit hit while moving un-homes the slider and forces a re-home. A MAX hit also forces a re-measure. |
+| Motor wired backwards | Homing stops with `WRONG DIRECTION` instead of driving into the far end. |
+| Shot too fast for the motors | Refused before moving, with the shortest time that would work. |
+| Poses outside the travel | Refused before moving (`RESET START/END`). |
+| Pan cable wind-up | Pan clamped to ±350°. |
+| Runaway knob | The target is capped a short way ahead of the carriage. |
+| Jerky starts, stops, turn-arounds | All shot speed changes are slew-limited to the axis acceleration. |
+| Electrical noise on limit switches | 3 ms press / 10 ms release debounce. |
+| Corrupt saved data | Checksum and sanity checks; bad data falls back to safe defaults. |
+| LCD or I²C failure | Bus timeouts, auto-disable and recovery when idle. Motion never waits on the display. |
 
 ---
 
 ## Configuration constants
 
-All of these are at the top of [src/main.cpp](src/main.cpp):
+All of these are near the top of [src/main.cpp](src/main.cpp):
 
 | Constant | Default | Meaning |
 |---|---|---|
 | `LCD_COLS` / `LCD_ROWS` | 16 / 2 | Display size. |
-| `LCD_ROW_OFFSET` | `{0x00,0x40}` | DDRAM row addresses (16×4 panels use `{0x00,0x40,0x10,0x50}`). |
+| `LCD_ROW_OFFSET` | `{0x00,0x40}` | DDRAM row addresses. |
 | `LIMIT_ACTIVE_LEVEL` | `LOW` | Pin level that means "switch pressed". |
 | `X_DIR_INVERT` / `Y_DIR_INVERT` | `false` | Reverse motor direction. |
 | `ENC_INVERT` | `false` | Reverse encoder direction. |
@@ -356,42 +430,45 @@ All of these are at the top of [src/main.cpp](src/main.cpp):
 | `X_STEPS_PER_MM` | 80 | Slider steps per mm. |
 | `Y_STEPS_PER_DEG` | 12800/360 ≈ 35.56 | Pan steps per degree. |
 | `X_VMAX` / `Y_VMAX` | 3000 steps/s | Max speed (≈ 37.5 mm/s, ≈ 84 °/s). |
-| `X_ACC` / `Y_ACC` | 6000 steps/s² | Acceleration for jog/goto moves. |
-| `SPEED_PCT` | 25 % / 50 % / 100 % | Speed setting presets. |
-| `X_HOME_SPEED` | 1000 steps/s | Homing speed. |
+| `X_ACC` / `Y_ACC` | 6000 steps/s² | Acceleration; also the slew limit during a shot. |
+| `JOG_PCT` | 0.6 | Speed (fraction of max) while setting poses. |
+| `PAN_LIMIT_DEG` | 350 | Pan travel limit either side of 0°. |
+| `X_HOME_SPEED` | 1200 steps/s | Homing speed. |
 | `X_BACKOFF_STEPS` | 240 (3 mm) | Distance to back off a switch. |
-| `X_HOME_TIMEOUT_MS` | 120 000 | Homing timeout. |
-| `MAX_KF` | 20 | Keyframes per sequence slot. |
-| `NUM_SLOTS` | 5 | Number of sequence slots (A–E). |
+| `X_HOME_TIMEOUT_MS` | 300 000 | Homing timeout (5 min). |
+| `PLAY_KP` | 6.0 | Shot position-correction gain. |
+| `PLAY_RAMP_MS` | 1000 | Soft-start time for a shot. |
 | `DELAY_S` | 0 / 3 / 5 / 10 s | Start-delay choices (index 0 = OFF). |
-| `DEFAULT_KF_SECONDS` | 5.0 | Duration given to new keyframes. |
-| `PLAY_KP` | 6.0 | Playback position-correction gain. |
-| `PLAY_RAMP_MS` | 1000 | Soft-start time for playback. |
-| `X_STEP_MM` / `Y_STEP_DEG` | see Jog section | Jog step-size presets. |
-| `DEBOUNCE_MS` / `LONG_MS` / `DOUBLE_MS` | 25 / 700 / 280 | Button timing. |
+| `DEBOUNCE_MS` / `LONG_MS` | 25 / 700 | Button debounce and hold time. |
+| `LIMIT_PRESS_US` / `LIMIT_RELEASE_US` | 3000 / 10000 µs | Limit-switch debounce. These are defined in the *Limit switches* section. |
+
+The move to START always runs at 50 % of max speed. This is fixed in `gotoA()`.
 
 ---
 
 ## Persistent storage
 
-Settings are stored in ESP32 NVS (flash) under the namespace `slider`:
+Everything you set is kept in one record, `shot`, in ESP32 NVS (flash) under the namespace `rig`:
 
-| Key | Contents |
+| Field | Contents |
 |---|---|
-| `kfn0` … `kfn4` | Number of keyframes in slot A … E. |
-| `kf0` … `kf4` | Raw keyframe array for slot A … E (`x`, `y` in steps, `dur` in seconds). |
-| `slot` | Active slot (0–4). |
-| `cfg` | Loop / Ease / Speed / Delay. |
-| `xcal` / `xmax` | Whether travel has been measured, and its length in steps. |
+| `sx`, `sy` | START pose: slider and pan, in steps. |
+| `ex`, `ey` | END pose. |
+| `xmax` | Measured slider travel, in steps. |
+| `dur` | Shot time, 1–600 s. |
+| `ease`, `loop`, `delayIdx` | Options. |
+| `flags` | Which of START / END / travel are set. |
+| `ck` | FNV-1a checksum of all of the above. |
 
-**Upgrading from single-sequence firmware:**
+- The record is saved straight away whenever something changes.
+- On boot it's loaded only if the size matches, the checksum matches, and every field is in range. Otherwise the rig starts from **safe defaults**: no poses, 10 s, Ease ON, Loop OFF, Delay OFF, travel not measured.
+- **Not saved:** the homed state and the pan zero. You home at every power-up, and the pan zero is wherever the pan points when you click.
 
-- Keyframes saved by older firmware under `kfn`/`kf` are loaded into **slot A** automatically, as long as slot A hasn't been saved yet. The old keys are left in flash but no longer written.
-- `cfg` grew by one byte for the Delay setting. The size no longer matches, so Loop, Ease and Speed reset to their defaults (Loop OFF, Ease ON, Speed Med, Delay OFF) on the first boot. Set them again once.
+Poses are stored in **steps**, not mm/degrees. If you change `X_STEPS_PER_MM`, `Y_STEPS_PER_DEG` or the microstepping, set START and END again.
 
-The **homed state and current positions are not saved**. After every power-up, X and Y both read 0, and the slider must be homed again before you can record, use Go to, or play.
+### Upgrading from the keyframe firmware
 
-Keyframes are stored in **steps**, not mm/degrees. If you change `X_STEPS_PER_MM`, `Y_STEPS_PER_DEG` or the microstepping, re-record or clear existing keyframes.
+This version uses a new namespace (`rig`) and doesn't read the old `slider` data. Keyframes, sequence slots and old settings are **not carried over**. Set up the shot from scratch after flashing. The old data is left in flash and does no harm.
 
 ---
 
@@ -401,7 +478,7 @@ Keyframes are stored in **steps**, not mm/degrees. If you change `X_STEPS_PER_MM
 `-D ARDUINO_USB_MODE=1` is missing from `build_flags`. See [Building and flashing](#building-and-flashing).
 
 ### Build: dozens of `redefinition of ...` errors
-The code has been pasted into `main.cpp` twice, so everything is defined twice. Look for a second `// Pan/Slider motion rig` header (often stuck to the closing `}` of `loop()`) and delete from there to the end of the file.
+The code has been pasted into `main.cpp` twice, so everything is defined twice. Look for a second copy of the header comment (often stuck to the closing `}` of `loop()`) and delete from there to the end of the file.
 
 ### Upload: `Please specify upload_port`
 PlatformIO couldn't find the board. Set `upload_port` in `platformio.ini`, or pass `--upload-port COMx`.
@@ -419,39 +496,28 @@ Windows can't see the board, or something else has the port open.
 ### LCD shows nothing
 - Check the serial monitor for `No LCD found - running headless`. If it's there, check SDA = GPIO8, SCL = GPIO9, power and GND.
 - If the backlight is on but no text shows, turn the contrast trimmer on the I²C backpack.
-- If text appears on the wrong lines, your panel uses different row offsets. Adjust `LCD_ROW_OFFSET`.
 
-### Messages and what to do
+### LCD goes blank or freezes during a move
+The firmware has detected a failing I²C bus and stopped writing to the LCD; motion continues. It retries once the rig is idle and redraws when the LCD answers. If this keeps happening, shorten the SDA/SCL wires, route them away from the motor cables, and check the backpack's pull-ups and its power.
 
-| Message | Meaning / fix |
-|---|---|
-| `HOME FIRST` | Home the slider before recording, Go to, or Play. |
-| `NEED 2+ KEYFRMS` | Playback needs at least two keyframes in the active slot. |
-| `NO SEGMENTS` | You chose **Play from** on the last keyframe; there's nothing after it to play. |
-| `SLOT X LOADED` | Slot X is now active. |
-| `CLEARED` | The active slot was emptied. |
-| `SEG n TOO FAST` | Segment *n* needs more speed than the motors allow. Increase its time. |
-| `LIMIT MIN` / `LIMIT MAX` | X was stopped by a switch. Jog away from it. |
-| `LIMIT WIRING?` | Both switches read as pressed. Check wiring or `LIMIT_ACTIVE_LEVEL`. |
-| `HOME TIMEOUT` | No switch was found within 120 s. Check the switch and the X direction. |
-| `KEYFRAMES FULL` | The active slot already has 20 keyframes. Use another slot. |
-| `START: NO TIME` | Keyframe 1 has no duration to edit. |
+### The pan angle of my shot is off after re-homing
+The pan zero is set from wherever the camera points when you click on `Aim pan ahead`. If you aim it differently than last time, the saved START/END pan angles shift by the same amount. Always aim at the same reference, or set START and END again.
 
-### Motor moves the wrong way / homing runs away from MIN
-Flip `X_DIR_INVERT`. Homing always moves in the negative direction first, so it has to drive *towards* the MIN switch.
+### Motor moves the wrong way / `WRONG DIRECTION` when homing
+Flip `X_DIR_INVERT`. Homing always moves in the negative direction first, so it has to drive *towards* the MIN switch. If the motor direction is right, the MIN and MAX switch wires are swapped.
 
-### Motors whine but don't move, or skip steps
-Lower `X_VMAX`/`Y_VMAX` or `X_ACC`/`Y_ACC`. Check the driver current setting and the motor supply voltage.
+### `LIMIT HIT-REHOME` during shots, or motors skip steps
+Lower `X_VMAX`/`Y_VMAX` or `X_ACC`/`Y_ACC`. Check the driver current setting, the motor supply voltage, the belt tension and the pulley set-screws.
 
 ---
 
 ## Known limitations
 
-- **No pan homing.** Y has no switch and no limits; its zero is set by hand and lost on reboot.
-- **Homing isn't saved.** You must re-home after every power cycle.
-- **Speed setting doesn't scale playback.** Keyframe durations set the speed of a timed move.
-- **Start delay runs once.** With Loop on, the delay only comes before the first pass, not between repeats.
-- **No per-slot settings.** Loop, Ease, Speed and Delay apply to every slot.
-- **Keyframe format is raw binary.** If you change the `Keyframe` struct layout, old saved keyframes will load as garbage. Clear them after such a change.
+- **One shot only.** There's one START→END move; no multi-point paths or stored shot library.
+- **No pan homing.** The pan has no switch. Its zero is set by hand at every home, and the poses depend on aiming it the same way each time.
+- **Homing isn't saved.** You must home after every power cycle.
+- **Single saved copy.** The shot is stored as one checksummed record. If power is lost *while* it's being saved, the checksum fails on the next boot and everything resets to defaults. Corrupt data is never used, but the setup has to be redone.
+- **Fixed speeds outside the shot.** Pose setting runs at 60 % and the move to START at 50 % of max speed; there's no speed setting.
+- **No pan protection beyond the ±350° clamp.** Lost steps are only detected on the slider (X).
 - **Single-threaded stepping.** Step pulses come from `loop()`, so very high step rates depend on the loop running fast. The LCD write budget exists to protect this.
-- **Hardware not yet verified on the bench.** The firmware builds, but it hasn't yet been flashed and checked on the rig. Work through the [First power-up checklist](#first-power-up-checklist) before you trust any of the constants above.
+- **Hardware not yet verified on the bench.** The firmware hasn't yet been flashed and checked on the rig. Work through the [First power-up checklist](#first-power-up-checklist) before you trust any of the constants above.
