@@ -64,7 +64,10 @@ Preferences prefs;
 struct Keyframe { int32_t x; int32_t y; float dur; };  // dur = seconds from previous keyframe
 Keyframe kf[MAX_KF];
 uint8_t kfCount = 0;
-struct Settings { uint8_t loop; uint8_t ease; uint8_t speed; } cfg = {0, 1, 1};
+struct Settings { uint8_t loop; uint8_t ease; uint8_t speed; uint8_t delayIdx; } cfg = {0, 1, 1, 0};
+#define NUM_SLOTS 5
+static const uint8_t DELAY_S[4] = {0, 3, 5, 10};   // start-delay choices in seconds
+uint8_t slot = 0, slotSel = 0;
 
 bool xHomed = false, xCal = false;
 long xMaxSteps = 0;
@@ -73,9 +76,9 @@ char want[LCD_ROWS][LCD_COLS + 1];
 char shown[LCD_ROWS][LCD_COLS + 1];
 int curR = -1, curC = -1;
 
-enum Screen { S_MENU, S_JOG, S_KFLIST, S_KFACT, S_KFTIME, S_PLAY, S_HOMEMENU, S_HOMING, S_SETTINGS, S_DIAG, S_CONFIRM };
+enum Screen { S_MENU, S_JOG, S_KFLIST, S_KFACT, S_KFTIME, S_PLAY, S_HOMEMENU, S_HOMING, S_SETTINGS, S_DIAG, S_CONFIRM, S_SLOT };
 enum HomeStage { H_IDLE, H_SEEK_MIN, H_BACKOFF_MIN, H_SEEK_MAX, H_BACKOFF_MAX, H_RETURN };
-enum PlayStage { P_IDLE, P_GOTO, P_RUN };
+enum PlayStage { P_IDLE, P_GOTO, P_DELAY, P_RUN };
 Screen scr = S_MENU;
 HomeStage homeStage = H_IDLE;
 PlayStage playStage = P_IDLE;
@@ -83,7 +86,9 @@ int cur = 0, top = 0, selKF = 0;
 int jogAxis = 0, jogStep = 1, diagPage = 0;
 bool homeMeasure = false;
 long homeTrip = 0;
-uint32_t homeT0 = 0, playT0 = 0, lastDraw = 0;
+uint32_t homeT0 = 0, playT0 = 0, delayT0 = 0, lastDraw = 0;
+int playStart = 0;
+bool playFirst = true;
 float playTotal = 0;
 char toastMsg[LCD_COLS + 1] = "";
 uint32_t toastUntil = 0;
@@ -147,16 +152,38 @@ Input pollInput() {
 }
 
 // ---------------- PERSISTENCE ----------------
-void saveKeyframes() { prefs.putUChar("kfn", kfCount); prefs.putBytes("kf", kf, kfCount * sizeof(Keyframe)); }
+void slotKeys(uint8_t n, char *kn, char *kb) { snprintf(kn, 8, "kfn%u", n); snprintf(kb, 8, "kf%u", n); }
+void saveKeyframes() {
+  char kn[8], kb[8]; slotKeys(slot, kn, kb);
+  prefs.putUChar(kn, kfCount); prefs.putBytes(kb, kf, kfCount * sizeof(Keyframe));
+}
 void saveSettings() { prefs.putBytes("cfg", &cfg, sizeof cfg); }
 void saveCalibration() { prefs.putBool("xcal", xCal); prefs.putLong("xmax", xMaxSteps); }
+// Loads slot n into the working keyframe list. Slot 0 also picks up keyframes saved by older firmware.
+void loadSlot(uint8_t n) {
+  slot = n; kfCount = 0;
+  char kn[8], kb[8]; slotKeys(n, kn, kb);
+  const char *cn = kn, *cb = kb;
+  if (!prefs.isKey(kn) && n == 0 && prefs.isKey("kfn")) { cn = "kfn"; cb = "kf"; }
+  kfCount = prefs.getUChar(cn, 0);
+  if (kfCount > MAX_KF) kfCount = 0;
+  if (kfCount) prefs.getBytes(cb, kf, kfCount * sizeof(Keyframe));
+}
+uint8_t slotCount(uint8_t n) {
+  if (n == slot) return kfCount;
+  char kn[8], kb[8]; slotKeys(n, kn, kb);
+  const char *cn = kn;
+  if (!prefs.isKey(kn) && n == 0 && prefs.isKey("kfn")) cn = "kfn";
+  uint8_t c = prefs.getUChar(cn, 0);
+  return c > MAX_KF ? 0 : c;
+}
 void loadAll() {
   prefs.begin("slider", false);
-  kfCount = prefs.getUChar("kfn", 0);
-  if (kfCount > MAX_KF) kfCount = 0;
-  if (kfCount) prefs.getBytes("kf", kf, kfCount * sizeof(Keyframe));
+  uint8_t sl = prefs.getUChar("slot", 0);
+  loadSlot(sl < NUM_SLOTS ? sl : 0);
   if (prefs.getBytesLength("cfg") == sizeof cfg) prefs.getBytes("cfg", &cfg, sizeof cfg);
   if (cfg.speed > 2) cfg.speed = 1;
+  if (cfg.delayIdx > 3) cfg.delayIdx = 0;
   xCal = prefs.getBool("xcal", false);
   xMaxSteps = prefs.getLong("xmax", 0);
   if (xMaxSteps <= 0) xCal = false;
@@ -273,16 +300,18 @@ void homingUpdate() {
 // ---------------- PLAYBACK ----------------
 int playSeg = 1;
 
-void gotoKeyframe0() {
+void gotoKeyframe0() {   // go to the keyframe the run starts from
   applyProfile();
-  stepX.moveTo(clampX(kf[0].x)); stepY.moveTo(kf[0].y);
+  stepX.moveTo(clampX(kf[playStart].x)); stepY.moveTo(kf[playStart].y);
   playStage = P_GOTO;
 }
-void startPlay() {
+void beginRun() { playT0 = millis(); playFirst = false; playStage = P_RUN; }
+void startPlay(int from = 0) {
   if (kfCount < 2) { toast("NEED 2+ KEYFRMS"); return; }
   if (!xHomed) { toast("HOME FIRST"); return; }
+  if (from > kfCount - 2) { toast("NO SEGMENTS"); return; }
   playTotal = 0;
-  for (int i = 1; i < kfCount; i++) {
+  for (int i = from + 1; i < kfCount; i++) {
     float d = kf[i].dur;
     float k = cfg.ease ? 1.5f : 1.0f;
     float vx = fabsf((float)(kf[i].x - kf[i - 1].x)) / d * k;
@@ -290,6 +319,7 @@ void startPlay() {
     if (vx > 0.9f * X_VMAX || vy > 0.9f * Y_VMAX) { char b[20]; snprintf(b, sizeof b, "SEG %d TOO FAST", i); toast(b); return; }
     playTotal += d;
   }
+  playStart = from; playSeg = from + 1; playFirst = true;
   scr = S_PLAY; gotoKeyframe0();
 }
 void stopPlay(const char *msg) {
@@ -303,7 +333,7 @@ void playRun() {
     if (cfg.loop) { gotoKeyframe0(); return; }
     stopPlay("DONE"); return;
   }
-  int s = 1; float start = 0;
+  int s = playStart + 1; float start = 0;
   while (s < kfCount - 1 && ts >= start + kf[s].dur) { start += kf[s].dur; s++; }
   playSeg = s;
   float dur = kf[s].dur, u = (ts - start) / dur;
@@ -326,8 +356,9 @@ void motionRun() {
   stepX.run(); stepY.run();
   if (playStage == P_GOTO && stepX.distanceToGo() == 0 && stepY.distanceToGo() == 0) {
     stepX.setMaxSpeed(X_VMAX); stepY.setMaxSpeed(Y_VMAX);
-    playT0 = millis(); playStage = P_RUN;
-  }
+    if (playFirst && cfg.delayIdx) { delayT0 = millis(); playStage = P_DELAY; }   // delay only before the first pass
+    else beginRun();
+  } else if (playStage == P_DELAY && millis() - delayT0 >= DELAY_S[cfg.delayIdx] * 1000UL) beginRun();
 }
 
 // ---------------- KEYFRAMES ----------------
@@ -349,30 +380,34 @@ void setScreen(Screen s, int c = 0) { scr = s; cur = c; top = 0; }
 
 int menuCount() {
   switch (scr) {
-    case S_MENU: return 6;
+    case S_MENU: return 7;
     case S_HOMEMENU: return 4;
     case S_KFLIST: return kfCount + 1;
-    case S_KFACT: return 5;
-    case S_SETTINGS: return 5;
+    case S_KFACT: return 6;
+    case S_SETTINGS: return 6;
     case S_CONFIRM: return 2;
     default: return 0;
   }
 }
 void menuItem(int i, char *b) {
-  static const char *MAINM[] = {"Jog / Record", "Play sequence", "Keyframes", "Home / Zero", "Settings", "Diagnostics"};
+  static const char *MAINM[] = {"Jog / Record", "Play sequence", "Keyframes", "", "Home / Zero", "Settings", "Diagnostics"};
   static const char *HOMEM[] = {"Home slider", "Home+measure", "Zero pan here", "Back"};
-  static const char *ACTM[] = {"Go to", "Set time", "Overwrite pos", "Delete", "Back"};
+  static const char *ACTM[] = {"", "", "Set time", "Overwrite pos", "", "Back"};
   static const char *SPD[] = {"Slow", "Med", "Fast"};
   b[0] = 0;
   switch (scr) {
-    case S_MENU: strcpy(b, MAINM[i]); break;
+    case S_MENU:
+      if (i == 3) snprintf(b, 20, "Slot: %c  %d KF", 'A' + slot, kfCount);
+      else strcpy(b, MAINM[i]);
+      break;
     case S_HOMEMENU:
       if (i == 0) snprintf(b, 20, "Home slider%s", xHomed ? " ok" : "");
       else strcpy(b, HOMEM[i]);
       break;
     case S_KFACT:
       if (i == 0) snprintf(b, 20, "Go to KF%d", selKF + 1);
-      else if (i == 3) snprintf(b, 20, "Delete KF%d", selKF + 1);
+      else if (i == 1) snprintf(b, 20, "Play from KF%d", selKF + 1);
+      else if (i == 4) snprintf(b, 20, "Delete KF%d", selKF + 1);
       else strcpy(b, ACTM[i]);
       break;
     case S_KFLIST:
@@ -383,16 +418,16 @@ void menuItem(int i, char *b) {
       if (i == 0) snprintf(b, 20, "Loop: %s", cfg.loop ? "ON" : "OFF");
       else if (i == 1) snprintf(b, 20, "Ease: %s", cfg.ease ? "ON" : "OFF");
       else if (i == 2) snprintf(b, 20, "Speed: %s", SPD[cfg.speed]);
-      else if (i == 3) strcpy(b, "Clear all KFs");
+      else if (i == 3) { if (cfg.delayIdx) snprintf(b, 20, "Delay: %ds", DELAY_S[cfg.delayIdx]); else strcpy(b, "Delay: OFF"); }
+      else if (i == 4) snprintf(b, 20, "Clear slot %c", 'A' + slot);
       else strcpy(b, "Back");
       break;
-    case S_CONFIRM: strcpy(b, i == 0 ? "No, keep" : "Yes, clear"); break;
     default: break;
   }
 }
 void drawMenu() {
   if (scr == S_CONFIRM) {
-    row(0, "Clear all KFs?");
+    row(0, "Clear slot %c?", 'A' + slot);
     row(1, "%cNo, keep %cYes", cur == 0 ? '>' : ' ', cur == 1 ? '>' : ' ');
     return;
   }
@@ -408,13 +443,14 @@ void drawMenu() {
 void goBack() {
   switch (scr) {
     case S_KFACT: setScreen(S_KFLIST, selKF); break;
-    case S_CONFIRM: setScreen(S_SETTINGS, 3); break;
+    case S_CONFIRM: setScreen(S_SETTINGS, 4); break;
     case S_JOG: setScreen(S_MENU, 0); break;
     case S_KFLIST: setScreen(S_MENU, 2); break;
-    case S_HOMEMENU: setScreen(S_MENU, 3); break;
-    case S_SETTINGS: setScreen(S_MENU, 4); break;
-    case S_DIAG: setScreen(S_MENU, 5); break;
-    case S_KFTIME: setScreen(S_KFACT, 1); break;
+    case S_SLOT: setScreen(S_MENU, 3); break;
+    case S_HOMEMENU: setScreen(S_MENU, 4); break;
+    case S_SETTINGS: setScreen(S_MENU, 5); break;
+    case S_DIAG: setScreen(S_MENU, 6); break;
+    case S_KFTIME: setScreen(S_KFACT, 2); break;
     default: break;
   }
 }
@@ -426,9 +462,10 @@ void menuSelect() {
         case 0: setScreen(S_JOG); break;
         case 1: startPlay(); break;
         case 2: setScreen(S_KFLIST); break;
-        case 3: setScreen(S_HOMEMENU); break;
-        case 4: setScreen(S_SETTINGS); break;
-        case 5: diagPage = 0; setScreen(S_DIAG); break;
+        case 3: slotSel = slot; setScreen(S_SLOT); break;
+        case 4: setScreen(S_HOMEMENU); break;
+        case 5: setScreen(S_SETTINGS); break;
+        case 6: diagPage = 0; setScreen(S_DIAG); break;
       }
       break;
     case S_HOMEMENU:
@@ -446,22 +483,25 @@ void menuSelect() {
         applyProfile();
         stepX.moveTo(clampX(kf[selKF].x)); stepY.moveTo(kf[selKF].y); toast("MOVING...");
       } else if (cur == 1) {
-        if (selKF == 0) toast("START: NO TIME"); else setScreen(S_KFTIME);
+        startPlay(selKF);
       } else if (cur == 2) {
+        if (selKF == 0) toast("START: NO TIME"); else setScreen(S_KFTIME);
+      } else if (cur == 3) {
         kf[selKF].x = stepX.currentPosition(); kf[selKF].y = stepY.currentPosition(); saveKeyframes(); toast("OVERWRITTEN");
-      } else if (cur == 3) { deleteKeyframe(selKF); toast("DELETED"); setScreen(S_KFLIST); }
+      } else if (cur == 4) { deleteKeyframe(selKF); toast("DELETED"); setScreen(S_KFLIST); }
       else goBack();
       break;
     case S_SETTINGS:
       if (cur == 0) { cfg.loop ^= 1; saveSettings(); }
       else if (cur == 1) { cfg.ease ^= 1; saveSettings(); }
       else if (cur == 2) { cfg.speed = (cfg.speed + 1) % 3; saveSettings(); applyProfile(); }
-      else if (cur == 3) setScreen(S_CONFIRM);
+      else if (cur == 3) { cfg.delayIdx = (cfg.delayIdx + 1) % 4; saveSettings(); }
+      else if (cur == 4) setScreen(S_CONFIRM);
       else goBack();
       break;
     case S_CONFIRM:
       if (cur == 1) { kfCount = 0; saveKeyframes(); toast("CLEARED"); }
-      setScreen(S_SETTINGS, 3);
+      setScreen(S_SETTINGS, 4);
       break;
     default: break;
   }
@@ -491,8 +531,17 @@ void handleInput(const Input &in) {
       if (in.rot) d += in.rot * 0.5f;
       if (in.rotHeld) d += in.rotHeld * 5.0f;
       d = constrain(d, 0.5f, 600.0f);
-      if (in.ev == EV_CLICK) { saveKeyframes(); setScreen(S_KFACT, 1); }
+      if (in.ev == EV_CLICK) { saveKeyframes(); setScreen(S_KFACT, 2); }
       else if (in.ev == EV_LONG) { saveKeyframes(); goBack(); }
+      break; }
+    case S_SLOT: {
+      int r = in.rot + in.rotHeld;
+      if (r) slotSel = constrain((int)slotSel + (r > 0 ? 1 : -1), 0, NUM_SLOTS - 1);
+      if (in.ev == EV_CLICK) {
+        if (slotSel != slot) { loadSlot(slotSel); prefs.putUChar("slot", slot); }
+        char b[20]; snprintf(b, sizeof b, "SLOT %c LOADED", 'A' + slot); toast(b);
+        setScreen(S_MENU, 3);
+      } else if (in.ev == EV_LONG) goBack();
       break; }
     case S_HOMING: if (in.ev != EV_NONE) abortHome(); break;
     case S_PLAY: if (in.ev != EV_NONE) stopPlay("STOPPED"); break;
@@ -531,10 +580,25 @@ void draw() {
       row(1, "X%.0f  click:stop", xmm());
       break; }
     case S_PLAY:
-      if (playStage == P_GOTO) row(0, "PLAY: to start");
-      else row(0, "P%d/%d %.0f/%.0fs", playSeg, kfCount - 1, (millis() - playT0) / 1000.0f, playTotal);
-      row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH);
+      if (playStage == P_GOTO) { row(0, "PLAY: to start"); row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH); }
+      else if (playStage == P_DELAY) {
+        long left = ((long)DELAY_S[cfg.delayIdx] * 1000L - (long)(millis() - delayT0) + 999) / 1000;
+        row(0, "Start in %lds", left < 0 ? 0L : left);
+        row(1, "click = cancel");
+      } else {
+        row(0, "P%d/%d %.0f/%.0fs", playSeg - playStart, kfCount - 1 - playStart, (millis() - playT0) / 1000.0f, playTotal);
+        row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH);
+      }
       break;
+    case S_SLOT: {
+      char line[24] = ""; 
+      for (int i = 0; i < NUM_SLOTS; i++) {
+        char c[5]; if (i == slotSel) snprintf(c, sizeof c, "[%c]", 'A' + i); else snprintf(c, sizeof c, " %c ", 'A' + i);
+        strcat(line, c);
+      }
+      row(0, "%s", line);
+      row(1, "%d KF%s", slotCount(slotSel), slotSel == slot ? " (active)" : "");
+      break; }
     case S_DIAG:
       if (diagPage == 0) {
         row(0, "MIN:%d MAX:%d", minHit(), maxHit());
@@ -583,7 +647,7 @@ void setup() {
     lcd->init(); lcd->backlight(); lcd->clear();
   } else Serial.println("No LCD found - running headless");
 
-  row(0, "MOTION RIG"); row(1, "KF stored: %d", kfCount);
+  row(0, "MOTION RIG"); row(1, "Slot %c: %d KF", 'A' + slot, kfCount);
   for (int i = 0; i < 20; i++) { lcdFlush(100); delay(40); }
   uint32_t t0 = millis(); while (millis() - t0 < 1000) { lcdFlush(100); }
 }

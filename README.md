@@ -2,6 +2,12 @@
 
 Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop switches, and a **pan head (Y)**. You control everything with one rotary encoder and a 16×2 I²C LCD. You can jog the rig to positions, save them as keyframes with timings, and play the move back smoothly, once or on a loop.
 
+Highlights:
+
+- **5 sequence slots (A–E)**, each holding up to 20 keyframes, kept in flash.
+- **Start delay** (off, 3, 5 or 10 s) between reaching the start position and the move beginning.
+- **Play from here:** start playback from any keyframe instead of the first.
+
 - **MCU:** ESP32-C3 SuperMini
 - **Framework:** Arduino on PlatformIO (`espressif32`)
 - **Source:** all firmware is in [src/main.cpp](src/main.cpp)
@@ -123,7 +129,7 @@ The board should now enumerate as a USB serial device (Espressif VID `303A`). Re
 
 Do these in order before you run a real move:
 
-1. **LCD.** The splash screen should read `MOTION RIG / KF stored: N`. If the screen is blank, see [Troubleshooting](#lcd-shows-nothing).
+1. **LCD.** The splash screen should read `MOTION RIG / Slot A: N KF` (the active slot and its keyframe count). If the screen is blank, see [Troubleshooting](#lcd-shows-nothing).
 2. **Diagnostics** (`Main menu → Diagnostics`, turn the encoder to change page):
    - Page 1: `MIN:0 MAX:0` with nothing pressed. Press each switch by hand: its value should go to `1`. If the values are inverted, set `LIMIT_ACTIVE_LEVEL` to `HIGH`.
    - Page 2: turn the encoder. `Enc` should change by **1 per click**. If it changes by 2 per click or skips, set `ENC_TRANSITIONS_PER_DETENT` to `2`. If it counts the wrong way, set `ENC_INVERT`.
@@ -160,11 +166,12 @@ Double-click only works on the Jog screen. Everywhere else a click responds imme
 ```
 MAIN MENU
 ├── Jog / Record
-├── Play sequence
-├── Keyframes
-│   ├── 1: <x>mm <y>°  →  Go to KFn | Set time | Overwrite pos | Delete KFn | Back
+├── Play sequence         (plays the active slot from KF 1)
+├── Keyframes             (keyframes of the active slot)
+│   ├── 1: <x>mm <y>°  →  Go to KFn | Play from KFn | Set time | Overwrite pos | Delete KFn | Back
 │   ├── 2: ...
 │   └── Back
+├── Slot: A  3 KF         (pick the active sequence slot, A–E)
 ├── Home / Zero
 │   ├── Home slider [ok]  (seek MIN, set X = 0; shows "ok" once homed)
 │   ├── Home+measure      (seek MIN, then MAX, save travel length)
@@ -174,7 +181,8 @@ MAIN MENU
 │   ├── Loop: ON/OFF
 │   ├── Ease: ON/OFF
 │   ├── Speed: Slow/Med/Fast
-│   ├── Clear all KFs     → confirm: No, keep / Yes
+│   ├── Delay: OFF/3s/5s/10s
+│   ├── Clear slot A      → confirm: No, keep / Yes
 │   └── Back
 └── Diagnostics
 ```
@@ -190,7 +198,7 @@ MAIN MENU
 - The character after `mm` is `H` when the slider is homed and `!` when it isn't.
 - `S` is the current step size for the active axis: slider **0.5 / 2 / 10 / 50 mm**, pan **0.5 / 2 / 10 / 45°**.
 - Turns add up: spinning fast queues several steps, and the axis accelerates to cover them.
-- Double-click saves the current X/Y as a new keyframe. This requires the slider to be homed. Up to 20 keyframes.
+- Double-click saves the current X/Y as a new keyframe. This requires the slider to be homed. Keyframes go into the **active slot**, up to 20 per slot.
 
 ### Keyframes
 
@@ -199,30 +207,59 @@ Each keyframe stores an X position, a Y position, and a **duration**: the number
 | Action | Effect |
 |---|---|
 | Go to | Moves the rig to that keyframe at the current Speed setting (requires homing). |
+| Play from | Plays the sequence **starting at this keyframe** instead of KF 1. See [Play from here](#play-from-here). |
 | Set time | Edits the duration (0.5–600 s, default 5 s). The screen shows `KFn TIME` / `5.0s hold:5s`. Not available on keyframe 1. |
 | Overwrite pos | Replaces the stored position with where the rig is now. |
 | Delete | Removes the keyframe. If you delete keyframe 1, the next keyframe becomes the start. |
 
-Every change is saved to flash immediately.
+Every change is saved to flash immediately, in the active slot.
+
+### Play from here
+
+`Keyframes → KF n → Play from KFn` runs the move from keyframe *n* to the end, skipping the earlier segments. It's handy for re-shooting or checking the second half of a long move without waiting through the first.
+
+- The rig first drives to KF *n*, then the start delay runs (if set), then the timed move.
+- Only the segments after KF *n* are speed-checked, and the playback screen counts segments and time from KF *n*. For example, playing from KF 3 of 5 shows `P1/2`.
+- With **Loop** on, each repeat goes back to KF *n*, not KF 1.
+- You can't play from the last keyframe, because there is nothing after it (`NO SEGMENTS`).
+
+### Sequence slots
+
+There are **5 slots, A–E**. Each one holds its own sequence of up to 20 keyframes, so you can keep several moves stored and switch between them.
+
+```
+ A [B] C  D  E
+3 KF (active)
+```
+
+- `Main menu → Slot` opens the picker. Turn to move the `[ ]` cursor; the second line shows how many keyframes that slot holds, and `(active)` marks the current one.
+- Click to make the highlighted slot active (`SLOT B LOADED`). Long-press to leave without changing.
+- Jog/Record, Keyframes, Play sequence and Clear slot all work on the **active slot** only.
+- The active slot is remembered across power cycles. The splash screen shows it (`Slot B: 3 KF`).
+- Switching slots doesn't move the rig. All slots share the same home and pan zero, because keyframes are stored as absolute positions.
 
 ### Settings
 
 | Setting | Effect |
 |---|---|
-| **Loop** | Playback returns to keyframe 1 and repeats until you stop it. |
+| **Loop** | Playback returns to its start keyframe and repeats until you stop it. |
 | **Ease** | Each segment eases in and out (smoothstep) instead of moving at constant speed. Peak speed is 1.5× the segment average. |
 | **Speed** | Slow 25 % / Med 50 % / Fast 100 % of max speed. Applies to **jogging, Go to, and the move to the start of playback**. Timed playback ignores it, because the keyframe durations set the speed. |
-| **Clear all KFs** | Deletes all keyframes, after a confirmation (`Clear all KFs?` / `>No, keep  Yes`). |
+| **Delay** | Countdown after the rig reaches the start keyframe and before the timed move begins: OFF / 3 / 5 / 10 s. Click to cycle through them. Gives you time to start recording or step out of frame. It only runs before the **first** pass, so loops repeat straight away. |
+| **Clear slot X** | Deletes every keyframe in the active slot, after a confirmation (`Clear slot A?` / `>No, keep  Yes`). Other slots aren't touched. |
 
 ### Homing and playback screens
 
 ```
-HOME SeekMIN          P2/3 7/15s
-X0  click:stop        X 123.4 P   45°
+HOME SeekMIN          Start in 4s           P2/3 7/15s
+X0  click:stop        click = cancel        X 123.4 P   45°
 ```
 
 - **Homing** shows the current stage (`SeekMIN`, `BackOff`, `SeekMAX`, `BackMAX`, `Return`) and the X position in mm.
-- **Playback** shows `PLAY: to start` while moving to keyframe 1. After that it shows the current segment of the total, elapsed and total seconds, and live X (mm) and pan (°).
+- **Playback** goes through three screens:
+  1. `PLAY: to start`, with live X/pan, while the rig drives to the start keyframe.
+  2. `Start in Ns` if a start delay is set. A click cancels.
+  3. The running move: current segment of the total, elapsed and total seconds, and live X (mm) and pan (°).
 
 ### Diagnostics
 
@@ -240,11 +277,13 @@ Turn the encoder to flip between three pages. Any button press exits.
 
 1. Power on, then **Home / Zero → Home slider**. Use **Home+measure** the first time, or after you change the rails.
 2. **Zero pan here** to point the pan head at its reference.
-3. **Jog / Record:** move to the start framing and double-click (KF 1).
-4. Move to the next framing and double-click (KF 2). Repeat for as many as you need.
-5. **Keyframes → KF n → Set time** to set how long each segment takes.
-6. Optional: **Settings**, to turn Ease and/or Loop on.
-7. **Play sequence.** The rig drives to KF 1, then runs the timed move. Press the button at any time to stop.
+3. **Slot:** pick an empty slot (or the one you want to overwrite, after **Settings → Clear slot**).
+4. **Jog / Record:** move to the start framing and double-click (KF 1).
+5. Move to the next framing and double-click (KF 2). Repeat for as many as you need.
+6. **Keyframes → KF n → Set time** to set how long each segment takes.
+7. Optional: **Settings**, to turn on Ease and/or Loop, or set a start Delay.
+8. **Play sequence.** The rig drives to KF 1, counts down the delay, then runs the timed move. Press the button at any time to stop.
+9. To redo just part of the move, use **Keyframes → KF n → Play from KFn**.
 
 ---
 
@@ -284,14 +323,17 @@ SEEK_MIN → BACKOFF_MIN (3 mm, until switch releases) → X = 0
 
 ### Playback
 
-1. **Pre-check.** At least 2 keyframes and a homed slider are required. For each segment, the firmware works out the speed needed (×1.5 when Ease is on). If any segment needs more than 90 % of `X_VMAX`/`Y_VMAX`, playback refuses to start and shows `SEG n TOO FAST`. Give that segment more time.
-2. **GOTO.** A normal accelerated move to keyframe 1.
-3. **RUN.** Time-based tracking. For the current time *t*, the firmware computes where each axis *should* be (linear, or smoothstep with Ease). It then sets each motor's speed to
+Playback runs from a start keyframe (`playStart`): KF 1 for **Play sequence**, KF *n* for **Play from KFn**.
+
+1. **Pre-check.** At least 2 keyframes and a homed slider are required, and there must be at least one segment after the start keyframe. For each remaining segment, the firmware works out the speed needed (×1.5 when Ease is on). If any segment needs more than 90 % of `X_VMAX`/`Y_VMAX`, playback refuses to start and shows `SEG n TOO FAST`. Give that segment more time.
+2. **GOTO.** A normal accelerated move to the start keyframe.
+3. **DELAY.** On the first pass only, if `Delay` is set, the firmware waits that many seconds (non-blocking) with a countdown on screen.
+4. **RUN.** Time-based tracking. For the current time *t*, the firmware computes where each axis *should* be (linear, or smoothstep with Ease). It then sets each motor's speed to
 
    `feed-forward velocity + PLAY_KP × (ideal position − actual position)`
 
    capped at the axis maximum. This keeps both axes in step with the clock and with each other over long moves. For the first second (`PLAY_RAMP_MS`), speed builds up gradually so the start doesn't jerk.
-4. **End.** The rig stops with `DONE`. With Loop on, it goes back to keyframe 1 and repeats.
+5. **End.** The rig stops with `DONE`. With Loop on, it goes back to the start keyframe and repeats straight away, without the delay.
 
 ### LCD
 
@@ -319,7 +361,9 @@ All of these are at the top of [src/main.cpp](src/main.cpp):
 | `X_HOME_SPEED` | 1000 steps/s | Homing speed. |
 | `X_BACKOFF_STEPS` | 240 (3 mm) | Distance to back off a switch. |
 | `X_HOME_TIMEOUT_MS` | 120 000 | Homing timeout. |
-| `MAX_KF` | 20 | Keyframe slots. |
+| `MAX_KF` | 20 | Keyframes per sequence slot. |
+| `NUM_SLOTS` | 5 | Number of sequence slots (A–E). |
+| `DELAY_S` | 0 / 3 / 5 / 10 s | Start-delay choices (index 0 = OFF). |
 | `DEFAULT_KF_SECONDS` | 5.0 | Duration given to new keyframes. |
 | `PLAY_KP` | 6.0 | Playback position-correction gain. |
 | `PLAY_RAMP_MS` | 1000 | Soft-start time for playback. |
@@ -334,10 +378,16 @@ Settings are stored in ESP32 NVS (flash) under the namespace `slider`:
 
 | Key | Contents |
 |---|---|
-| `kfn` | Number of keyframes. |
-| `kf` | Raw keyframe array (`x`, `y` in steps, `dur` in seconds). |
-| `cfg` | Loop / Ease / Speed. |
+| `kfn0` … `kfn4` | Number of keyframes in slot A … E. |
+| `kf0` … `kf4` | Raw keyframe array for slot A … E (`x`, `y` in steps, `dur` in seconds). |
+| `slot` | Active slot (0–4). |
+| `cfg` | Loop / Ease / Speed / Delay. |
 | `xcal` / `xmax` | Whether travel has been measured, and its length in steps. |
+
+**Upgrading from single-sequence firmware:**
+
+- Keyframes saved by older firmware under `kfn`/`kf` are loaded into **slot A** automatically, as long as slot A hasn't been saved yet. The old keys are left in flash but no longer written.
+- `cfg` grew by one byte for the Delay setting. The size no longer matches, so Loop, Ease and Speed reset to their defaults (Loop OFF, Ease ON, Speed Med, Delay OFF) on the first boot. Set them again once.
 
 The **homed state and current positions are not saved**. After every power-up, X and Y both read 0, and the slider must be homed again before you can record, use Go to, or play.
 
@@ -376,12 +426,15 @@ Windows can't see the board, or something else has the port open.
 | Message | Meaning / fix |
 |---|---|
 | `HOME FIRST` | Home the slider before recording, Go to, or Play. |
-| `NEED 2+ KEYFRMS` | Playback needs at least two keyframes. |
+| `NEED 2+ KEYFRMS` | Playback needs at least two keyframes in the active slot. |
+| `NO SEGMENTS` | You chose **Play from** on the last keyframe; there's nothing after it to play. |
+| `SLOT X LOADED` | Slot X is now active. |
+| `CLEARED` | The active slot was emptied. |
 | `SEG n TOO FAST` | Segment *n* needs more speed than the motors allow. Increase its time. |
 | `LIMIT MIN` / `LIMIT MAX` | X was stopped by a switch. Jog away from it. |
 | `LIMIT WIRING?` | Both switches read as pressed. Check wiring or `LIMIT_ACTIVE_LEVEL`. |
 | `HOME TIMEOUT` | No switch was found within 120 s. Check the switch and the X direction. |
-| `KEYFRAMES FULL` | All 20 slots are in use. |
+| `KEYFRAMES FULL` | The active slot already has 20 keyframes. Use another slot. |
 | `START: NO TIME` | Keyframe 1 has no duration to edit. |
 
 ### Motor moves the wrong way / homing runs away from MIN
@@ -397,6 +450,8 @@ Lower `X_VMAX`/`Y_VMAX` or `X_ACC`/`Y_ACC`. Check the driver current setting and
 - **No pan homing.** Y has no switch and no limits; its zero is set by hand and lost on reboot.
 - **Homing isn't saved.** You must re-home after every power cycle.
 - **Speed setting doesn't scale playback.** Keyframe durations set the speed of a timed move.
+- **Start delay runs once.** With Loop on, the delay only comes before the first pass, not between repeats.
+- **No per-slot settings.** Loop, Ease, Speed and Delay apply to every slot.
 - **Keyframe format is raw binary.** If you change the `Keyframe` struct layout, old saved keyframes will load as garbage. Clear them after such a change.
 - **Single-threaded stepping.** Step pulses come from `loop()`, so very high step rates depend on the loop running fast. The LCD write budget exists to protect this.
 - **Hardware not yet verified on the bench.** The firmware builds, but it hasn't yet been flashed and checked on the rig. Work through the [First power-up checklist](#first-power-up-checklist) before you trust any of the constants above.
