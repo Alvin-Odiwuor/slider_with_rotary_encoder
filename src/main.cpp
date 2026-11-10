@@ -1,4 +1,4 @@
-// Pan/Slider motion rig - ESP32-C3 SuperMini, CNC shield drivers, 16x4 I2C LCD, rotary encoder.
+// Pan/Slider motion rig - ESP32-C3 SuperMini, CNC shield drivers, 16x2 I2C LCD, rotary encoder.
 // X = linear slider (MIN/MAX limit switches), Y = pan. Everything is driven from the encoder.
 #include <Arduino.h>
 #include <Wire.h>
@@ -22,8 +22,8 @@
 
 // ---------------- USER SETTINGS (verify these against your build) ----------------
 #define LCD_COLS 16
-#define LCD_ROWS 4
-static const uint8_t LCD_ROW_OFFSET[4] = {0x00, 0x40, 0x10, 0x50};
+#define LCD_ROWS 2
+static const uint8_t LCD_ROW_OFFSET[2] = {0x00, 0x40};
 #define LIMIT_ACTIVE_LEVEL LOW      // 3-wire module: flip to HIGH if Diagnostics shows inverted
 #define X_DIR_INVERT false
 #define Y_DIR_INVERT false
@@ -80,7 +80,7 @@ Screen scr = S_MENU;
 HomeStage homeStage = H_IDLE;
 PlayStage playStage = P_IDLE;
 int cur = 0, top = 0, selKF = 0;
-int jogAxis = 0, jogStep = 1;
+int jogAxis = 0, jogStep = 1, diagPage = 0;
 bool homeMeasure = false;
 long homeTrip = 0;
 uint32_t homeT0 = 0, playT0 = 0, lastDraw = 0;
@@ -164,6 +164,7 @@ void loadAll() {
 
 // ---------------- LCD ----------------
 void row(uint8_t r, const char *fmt, ...) {
+  if (r >= LCD_ROWS) return;
   char b[40];
   va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
   bool end = false;
@@ -365,8 +366,15 @@ void menuItem(int i, char *b) {
   b[0] = 0;
   switch (scr) {
     case S_MENU: strcpy(b, MAINM[i]); break;
-    case S_HOMEMENU: strcpy(b, HOMEM[i]); break;
-    case S_KFACT: strcpy(b, ACTM[i]); break;
+    case S_HOMEMENU:
+      if (i == 0) snprintf(b, 20, "Home slider%s", xHomed ? " ok" : "");
+      else strcpy(b, HOMEM[i]);
+      break;
+    case S_KFACT:
+      if (i == 0) snprintf(b, 20, "Go to KF%d", selKF + 1);
+      else if (i == 3) snprintf(b, 20, "Delete KF%d", selKF + 1);
+      else strcpy(b, ACTM[i]);
+      break;
     case S_KFLIST:
       if (i < kfCount) snprintf(b, 20, "%d:%.0fmm %.0f%c", i + 1, kf[i].x / X_STEPS_PER_MM, kf[i].y / Y_STEPS_PER_DEG, DEG_CH);
       else strcpy(b, "Back");
@@ -375,7 +383,7 @@ void menuItem(int i, char *b) {
       if (i == 0) snprintf(b, 20, "Loop: %s", cfg.loop ? "ON" : "OFF");
       else if (i == 1) snprintf(b, 20, "Ease: %s", cfg.ease ? "ON" : "OFF");
       else if (i == 2) snprintf(b, 20, "Speed: %s", SPD[cfg.speed]);
-      else if (i == 3) strcpy(b, "Clear keyframes");
+      else if (i == 3) strcpy(b, "Clear all KFs");
       else strcpy(b, "Back");
       break;
     case S_CONFIRM: strcpy(b, i == 0 ? "No, keep" : "Yes, clear"); break;
@@ -383,21 +391,17 @@ void menuItem(int i, char *b) {
   }
 }
 void drawMenu() {
-  int n = menuCount(); char t[20], b[24];
-  switch (scr) {
-    case S_MENU: strcpy(t, "MAIN MENU"); break;
-    case S_HOMEMENU: strcpy(t, xHomed ? "HOME/ZERO  [OK]" : "HOME/ZERO [NO]"); break;
-    case S_KFLIST: snprintf(t, sizeof t, "KEYFRAMES (%d)", kfCount); break;
-    case S_KFACT: snprintf(t, sizeof t, "KEYFRAME %d", selKF + 1); break;
-    case S_SETTINGS: strcpy(t, "SETTINGS"); break;
-    default: strcpy(t, "CLEAR ALL KEYS?"); break;
+  if (scr == S_CONFIRM) {
+    row(0, "Clear all KFs?");
+    row(1, "%cNo, keep %cYes", cur == 0 ? '>' : ' ', cur == 1 ? '>' : ' ');
+    return;
   }
+  int n = menuCount(); char b[24];
   if (cur < top) top = cur;
-  if (cur > top + 2) top = cur - 2;
-  row(0, "%s", t);
-  for (int i = 0; i < 3; i++) {
+  if (cur > top + 1) top = cur - 1;
+  for (int i = 0; i < 2; i++) {
     int k = top + i;
-    if (k < n) { menuItem(k, b); row(i + 1, "%c%s", k == cur ? '>' : ' ', b); } else row(i + 1, "");
+    if (k < n) { menuItem(k, b); row(i, "%c%s", k == cur ? '>' : ' ', b); } else row(i, "");
   }
 }
 
@@ -424,7 +428,7 @@ void menuSelect() {
         case 2: setScreen(S_KFLIST); break;
         case 3: setScreen(S_HOMEMENU); break;
         case 4: setScreen(S_SETTINGS); break;
-        case 5: setScreen(S_DIAG); break;
+        case 5: diagPage = 0; setScreen(S_DIAG); break;
       }
       break;
     case S_HOMEMENU:
@@ -492,7 +496,10 @@ void handleInput(const Input &in) {
       break; }
     case S_HOMING: if (in.ev != EV_NONE) abortHome(); break;
     case S_PLAY: if (in.ev != EV_NONE) stopPlay("STOPPED"); break;
-    case S_DIAG: if (in.ev != EV_NONE) goBack(); break;
+    case S_DIAG:
+      if (in.rot) diagPage = constrain(diagPage + (in.rot > 0 ? 1 : -1), 0, 2);
+      if (in.ev != EV_NONE) goBack();
+      break;
     default: {
       int n = menuCount();
       int rot = in.rot + in.rotHeld;
@@ -504,48 +511,45 @@ void handleInput(const Input &in) {
 }
 
 // ---------------- DRAW ----------------
+static void stepStr(char *o, float v) { if (v >= 10) snprintf(o, 8, "%.0f", v); else snprintf(o, 8, "%.1f", v); }
+
 void draw() {
   switch (scr) {
     case S_JOG: {
-      row(0, "JOG-%s %s", jogAxis ? "PAN" : "SLD", xHomed ? "HOMED" : "NOHOME");
-      row(1, "%cX %8.1f mm", jogAxis == 0 ? '>' : ' ', xmm());
-      row(2, "%cP %8.1f %c", jogAxis == 1 ? '>' : ' ', ydeg(), DEG_CH);
-      char st[12];
-      if (jogAxis == 0) snprintf(st, sizeof st, "%.1fmm", X_STEP_MM[jogStep]);
-      else snprintf(st, sizeof st, "%.1f%c", Y_STEP_DEG[jogStep], DEG_CH);
-      row(3, "Step %s KF:%d", st, kfCount);
+      char st[8];
+      stepStr(st, jogAxis == 0 ? X_STEP_MM[jogStep] : Y_STEP_DEG[jogStep]);
+      row(0, "%cX%8.1fmm %c", jogAxis == 0 ? '>' : ' ', xmm(), xHomed ? 'H' : '!');
+      row(1, "%cP%7.1f%c S%s", jogAxis == 1 ? '>' : ' ', ydeg(), DEG_CH, st);
       break; }
     case S_KFTIME:
-      row(0, "KF %d TIME", selKF + 1);
-      row(1, "%.1f s", kf[selKF].dur);
-      row(2, "Turn=0.5s");
-      row(3, "Hold+turn=5s OK");
+      row(0, "KF%d TIME", selKF + 1);
+      row(1, "%.1fs hold:5s", kf[selKF].dur);
       break;
     case S_HOMING: {
-      static const char *N[] = {"", "Seek MIN", "Back off", "Seek MAX", "Back off MAX", "Return"};
-      row(0, "HOMING");
-      row(1, "%s", N[homeStage]);
-      row(2, "X %.1f mm", xmm());
-      row(3, "Click = abort");
+      static const char *N[] = {"", "SeekMIN", "BackOff", "SeekMAX", "BackMAX", "Return"};
+      row(0, "HOME %s", N[homeStage]);
+      row(1, "X%.0f  click:stop", xmm());
       break; }
     case S_PLAY:
-      if (playStage == P_GOTO) { row(0, "PLAY: to start"); row(1, "Moving..."); }
-      else {
-        row(0, "PLAY seg %d/%d", playSeg, kfCount - 1);
-        row(1, "t %.1f/%.1fs", (millis() - playT0) / 1000.0f, playTotal);
-      }
-      row(2, "X%8.1f mm", xmm());
-      row(3, "P%8.1f %c ok=stop", ydeg(), DEG_CH);
+      if (playStage == P_GOTO) row(0, "PLAY: to start");
+      else row(0, "P%d/%d %.0f/%.0fs", playSeg, kfCount - 1, (millis() - playT0) / 1000.0f, playTotal);
+      row(1, "X%6.1f P%5.0f%c", xmm(), ydeg(), DEG_CH);
       break;
     case S_DIAG:
-      row(0, "MIN:%d MAX:%d", minHit(), maxHit());
-      row(1, "CLK%d DT%d SW%d", digitalRead(PIN_ENC_CLK), digitalRead(PIN_ENC_DT), digitalRead(PIN_ENC_SW));
-      row(2, "Enc %ld", (long)encTotal);
-      row(3, "X%ld Y%ld", stepX.currentPosition(), stepY.currentPosition());
+      if (diagPage == 0) {
+        row(0, "MIN:%d MAX:%d", minHit(), maxHit());
+        row(1, "SW:%d  turn=page", digitalRead(PIN_ENC_SW));
+      } else if (diagPage == 1) {
+        row(0, "CLK%d DT%d SW%d", digitalRead(PIN_ENC_CLK), digitalRead(PIN_ENC_DT), digitalRead(PIN_ENC_SW));
+        row(1, "Enc %ld", (long)encTotal);
+      } else {
+        row(0, "X steps %ld", stepX.currentPosition());
+        row(1, "Y steps %ld", stepY.currentPosition());
+      }
       break;
     default: drawMenu();
   }
-  if ((int32_t)(toastUntil - millis()) > 0) row(3, "%s", toastMsg);
+  if ((int32_t)(toastUntil - millis()) > 0) row(1, "%s", toastMsg);
   // Live limit indicator on every screen (top-right corner): < = MIN pressed, > = MAX pressed, # = both
   bool mn = minHit(), mx = maxHit();
   if (mn || mx) want[0][LCD_COLS - 1] = (mn && mx) ? '#' : (mn ? '<' : '>');
@@ -579,8 +583,7 @@ void setup() {
     lcd->init(); lcd->backlight(); lcd->clear();
   } else Serial.println("No LCD found - running headless");
 
-  row(0, "MOTION RIG"); row(1, "Slider + Pan"); row(2, "Home before use");
-  row(3, "KF stored: %d", kfCount);
+  row(0, "MOTION RIG"); row(1, "KF stored: %d", kfCount);
   for (int i = 0; i < 20; i++) { lcdFlush(100); delay(40); }
   uint32_t t0 = millis(); while (millis() - t0 < 1000) { lcdFlush(100); }
 }

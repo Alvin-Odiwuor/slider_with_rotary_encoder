@@ -1,6 +1,6 @@
 # Motion Rig — Slider + Pan Controller
 
-Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop switches, and a **pan head (Y)**. You control everything with one rotary encoder and a 16×4 I²C LCD. You can jog the rig to positions, save them as keyframes with timings, and play the move back smoothly, once or on a loop.
+Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop switches, and a **pan head (Y)**. You control everything with one rotary encoder and a 16×2 I²C LCD. You can jog the rig to positions, save them as keyframes with timings, and play the move back smoothly, once or on a loop.
 
 - **MCU:** ESP32-C3 SuperMini
 - **Framework:** Arduino on PlatformIO (`espressif32`)
@@ -35,7 +35,7 @@ Firmware for a two-axis camera motion rig: a **linear slider (X)** with end-stop
 | Stepper Y (pan) | 200 steps/rev, 16× microstep, **4:1 reduction** → 12 800 steps per 360°. |
 | 2 × limit switches | MIN and MAX ends of the slider. 3-wire modules or bare switches to GND. |
 | KY-040 rotary encoder | With push button. |
-| 16×4 HD44780 LCD + I²C backpack | Auto-detected at `0x27` or `0x3F`. |
+| 16×2 HD44780 LCD + I²C backpack | Auto-detected at `0x27` or `0x3F`. A 16×4 panel also works if you change `LCD_ROWS`/`LCD_ROW_OFFSET`, but the screens are laid out for 2 lines. |
 
 If your mechanics are different (pulley, gearing, microstepping), change the constants in [Configuration constants](#configuration-constants).
 
@@ -123,10 +123,10 @@ The board should now enumerate as a USB serial device (Espressif VID `303A`). Re
 
 Do these in order before you run a real move:
 
-1. **LCD.** The splash screen should read `MOTION RIG / Slider + Pan / Home before use / KF stored: N`. If the screen is blank, see [Troubleshooting](#lcd-shows-nothing).
-2. **Diagnostics** (`Main menu → Diagnostics`):
-   - `MIN:0 MAX:0` with nothing pressed. Press each switch by hand: its value should go to `1`. If the values are inverted, set `LIMIT_ACTIVE_LEVEL` to `HIGH`.
-   - Turn the encoder. `Enc` should change by **1 per click**. If it changes by 2 per click or skips, set `ENC_TRANSITIONS_PER_DETENT` to `2`. If it counts the wrong way, set `ENC_INVERT`.
+1. **LCD.** The splash screen should read `MOTION RIG / KF stored: N`. If the screen is blank, see [Troubleshooting](#lcd-shows-nothing).
+2. **Diagnostics** (`Main menu → Diagnostics`, turn the encoder to change page):
+   - Page 1: `MIN:0 MAX:0` with nothing pressed. Press each switch by hand: its value should go to `1`. If the values are inverted, set `LIMIT_ACTIVE_LEVEL` to `HIGH`.
+   - Page 2: turn the encoder. `Enc` should change by **1 per click**. If it changes by 2 per click or skips, set `ENC_TRANSITIONS_PER_DETENT` to `2`. If it counts the wrong way, set `ENC_INVERT`.
 3. **Directions.** In `Jog / Record`, turn clockwise in small steps. The slider should move **away from MIN**, and the pan should rotate the way you think of as positive. Fix either with `X_DIR_INVERT` / `Y_DIR_INVERT`.
 4. **Home.** `Home / Zero → Home+measure`. The slider should go to MIN, back off, travel to MAX, back off, and return to 0. Its usable length is then saved.
 5. **Pan zero.** Point the pan head where you want 0° and pick `Home / Zero → Zero pan here`.
@@ -137,20 +137,21 @@ Do these in order before you run a real move:
 
 There is one encoder with a push button. What each input does depends on the screen:
 
-| Input | Menus | Jog / Record | KF time edit | Homing / Play / Diagnostics |
-|---|---|---|---|---|
-| Turn | Move cursor | Move active axis by step size | ±0.5 s | — |
-| Hold + turn | Move cursor | Change step size | ±5 s | — |
-| Click | Select | Toggle axis (slider ⇄ pan) | Save and return | Abort / stop / exit |
-| Double-click | — | **Save keyframe here** | — | — |
-| Long press (≥ 0.7 s) | Back | Back to main menu | Save and back | Abort / stop / exit |
+| Input | Menus | Jog / Record | KF time edit | Diagnostics | Homing / Play |
+|---|---|---|---|---|---|
+| Turn | Move cursor | Move active axis by step size | ±0.5 s | Change page | — |
+| Hold + turn | Move cursor | Change step size | ±5 s | — | — |
+| Click | Select | Toggle axis (slider ⇄ pan) | Save and return | Exit | Abort / stop |
+| Double-click | — | **Save keyframe here** | — | — | — |
+| Long press (≥ 0.7 s) | Back | Back to main menu | Save and back | Exit | Abort / stop |
 
 Double-click only works on the Jog screen. Everywhere else a click responds immediately, with no double-click delay.
 
 ### Screen indicators
 
-- **Toast messages** (e.g. `KF 3 SAVED`, `HOME FIRST`, `LIMIT MIN`) replace the bottom line for 1.5 s.
+- **Toast messages** (e.g. `KF 3 SAVED`, `HOME FIRST`, `LIMIT MIN`) replace the second line for 1.5 s.
 - **Limit indicator.** The top-right character of every screen shows `<` while MIN is pressed, `>` while MAX is pressed, and `#` when both are pressed (a wiring fault).
+- **Menus** have no title line: the 2-line display shows two items at a time, and `>` marks the selected one. Scroll to see the rest.
 
 ---
 
@@ -161,11 +162,11 @@ MAIN MENU
 ├── Jog / Record
 ├── Play sequence
 ├── Keyframes
-│   ├── 1: <x>mm <y>°  →  Go to | Set time | Overwrite pos | Delete | Back
+│   ├── 1: <x>mm <y>°  →  Go to KFn | Set time | Overwrite pos | Delete KFn | Back
 │   ├── 2: ...
 │   └── Back
 ├── Home / Zero
-│   ├── Home slider       (seek MIN, set X = 0)
+│   ├── Home slider [ok]  (seek MIN, set X = 0; shows "ok" once homed)
 │   ├── Home+measure      (seek MIN, then MAX, save travel length)
 │   ├── Zero pan here     (current pan = 0°)
 │   └── Back
@@ -173,7 +174,7 @@ MAIN MENU
 │   ├── Loop: ON/OFF
 │   ├── Ease: ON/OFF
 │   ├── Speed: Slow/Med/Fast
-│   ├── Clear keyframes   → confirm: No, keep / Yes, clear
+│   ├── Clear all KFs     → confirm: No, keep / Yes
 │   └── Back
 └── Diagnostics
 ```
@@ -181,14 +182,13 @@ MAIN MENU
 ### Jog / Record
 
 ```
-JOG-SLD HOMED
->X    123.0 mm
- P     45.0 °
-Step 2.0mm KF:3
+>X   123.0mm H
+ P   45.0° S2.0
 ```
 
-- The `>` marks the active axis. Click to switch between slider (`SLD`) and pan (`PAN`).
-- Step sizes: slider **0.5 / 2 / 10 / 50 mm**, pan **0.5 / 2 / 10 / 45°**.
+- The `>` marks the active axis (X = slider, P = pan). Click to switch.
+- The character after `mm` is `H` when the slider is homed and `!` when it isn't.
+- `S` is the current step size for the active axis: slider **0.5 / 2 / 10 / 50 mm**, pan **0.5 / 2 / 10 / 45°**.
 - Turns add up: spinning fast queues several steps, and the axis accelerates to cover them.
 - Double-click saves the current X/Y as a new keyframe. This requires the slider to be homed. Up to 20 keyframes.
 
@@ -199,7 +199,7 @@ Each keyframe stores an X position, a Y position, and a **duration**: the number
 | Action | Effect |
 |---|---|
 | Go to | Moves the rig to that keyframe at the current Speed setting (requires homing). |
-| Set time | Edits the duration (0.5–600 s, default 5 s). Not available on keyframe 1. |
+| Set time | Edits the duration (0.5–600 s, default 5 s). The screen shows `KFn TIME` / `5.0s hold:5s`. Not available on keyframe 1. |
 | Overwrite pos | Replaces the stored position with where the rig is now. |
 | Delete | Removes the keyframe. If you delete keyframe 1, the next keyframe becomes the start. |
 
@@ -212,18 +212,27 @@ Every change is saved to flash immediately.
 | **Loop** | Playback returns to keyframe 1 and repeats until you stop it. |
 | **Ease** | Each segment eases in and out (smoothstep) instead of moving at constant speed. Peak speed is 1.5× the segment average. |
 | **Speed** | Slow 25 % / Med 50 % / Fast 100 % of max speed. Applies to **jogging, Go to, and the move to the start of playback**. Timed playback ignores it, because the keyframe durations set the speed. |
-| **Clear keyframes** | Deletes all keyframes, after a confirmation. |
+| **Clear all KFs** | Deletes all keyframes, after a confirmation (`Clear all KFs?` / `>No, keep  Yes`). |
+
+### Homing and playback screens
+
+```
+HOME SeekMIN          P2/3 7/15s
+X0  click:stop        X 123.4 P   45°
+```
+
+- **Homing** shows the current stage (`SeekMIN`, `BackOff`, `SeekMAX`, `BackMAX`, `Return`) and the X position in mm.
+- **Playback** shows `PLAY: to start` while moving to keyframe 1. After that it shows the current segment of the total, elapsed and total seconds, and live X (mm) and pan (°).
 
 ### Diagnostics
 
-```
-MIN:0 MAX:0
-CLK1 DT1 SW1
-Enc 42
-X1600 Y0
-```
+Turn the encoder to flip between three pages. Any button press exits.
 
-Shows the raw switch levels, the encoder pin states and running count, and both motor positions in steps. Any button press exits.
+| Page | Line 1 | Line 2 |
+|---|---|---|
+| 1 | `MIN:0 MAX:0` (limit switches) | `SW:1  turn=page` (encoder button) |
+| 2 | `CLK1 DT1 SW1` (raw encoder pins) | `Enc 42` (running detent count) |
+| 3 | `X steps 1600` | `Y steps 0` |
 
 ---
 
@@ -286,7 +295,7 @@ SEEK_MIN → BACKOFF_MIN (3 mm, until switch releases) → X = 0
 
 ### LCD
 
-At boot the firmware scans I²C for `0x27`, then `0x3F`. If it finds neither, it runs **headless**: everything still works and `No LCD found - running headless` is printed on serial. Row addresses use 16×4 offsets (`0x00, 0x40, 0x10, 0x50`).
+At boot the firmware scans I²C for `0x27`, then `0x3F`. If it finds neither, it runs **headless**: everything still works and `No LCD found - running headless` is printed on serial. Row addresses use the standard 16×2 offsets (`0x00, 0x40`). `row()` ignores writes to rows beyond `LCD_ROWS`.
 
 ---
 
@@ -296,8 +305,8 @@ All of these are at the top of [src/main.cpp](src/main.cpp):
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `LCD_COLS` / `LCD_ROWS` | 16 / 4 | Display size. |
-| `LCD_ROW_OFFSET` | `{0x00,0x40,0x10,0x50}` | DDRAM row addresses for 16×4 panels. |
+| `LCD_COLS` / `LCD_ROWS` | 16 / 2 | Display size. |
+| `LCD_ROW_OFFSET` | `{0x00,0x40}` | DDRAM row addresses (16×4 panels use `{0x00,0x40,0x10,0x50}`). |
 | `LIMIT_ACTIVE_LEVEL` | `LOW` | Pin level that means "switch pressed". |
 | `X_DIR_INVERT` / `Y_DIR_INVERT` | `false` | Reverse motor direction. |
 | `ENC_INVERT` | `false` | Reverse encoder direction. |
@@ -340,6 +349,9 @@ Keyframes are stored in **steps**, not mm/degrees. If you change `X_STEPS_PER_MM
 
 ### Build: `'Serial' was not declared in this scope`
 `-D ARDUINO_USB_MODE=1` is missing from `build_flags`. See [Building and flashing](#building-and-flashing).
+
+### Build: dozens of `redefinition of ...` errors
+The code has been pasted into `main.cpp` twice, so everything is defined twice. Look for a second `// Pan/Slider motion rig` header (often stuck to the closing `}` of `loop()`) and delete from there to the end of the file.
 
 ### Upload: `Please specify upload_port`
 PlatformIO couldn't find the board. Set `upload_port` in `platformio.ini`, or pass `--upload-port COMx`.
